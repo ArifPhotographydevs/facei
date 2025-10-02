@@ -3,7 +3,7 @@
 #
 # IMPORTANT:
 #  - Do NOT commit secret values into this file. Render will prompt for sync:false vars.
-#  - Replace region/plan if you want different Render locations or instance sizes.
+#  - Adjust schedule, plan, region as needed.
 
 services:
 
@@ -44,7 +44,6 @@ services:
       - key: PORT
         value: "5000"
 
-      # secrets — will be prompted (sync: false)
       - key: ACCESS_KEY
         sync: false
       - key: SECRET_KEY
@@ -58,7 +57,7 @@ services:
       - key: JWT_SECRET
         sync: false
 
-  # 3) Background worker (Docker) — runs RQ worker
+  # 3) Background worker (Docker) — runs RQ worker (face queue)
   - type: worker
     runtime: docker
     name: face-matcher-worker
@@ -68,8 +67,8 @@ services:
     plan: starter
     autoDeploy: true
 
-    # use array-form command so shell interpolation (env vars) is handled safely
-    command: ["sh", "-lc", "rq", "worker", "--url", \"$REDIS_URL\", "face"]
+    # use sh -lc as a single array item so env var interpolation works
+    command: ["sh", "-lc", "rq worker --url \"$REDIS_URL\" face"]
 
     scaling:
       minInstances: 1
@@ -106,7 +105,8 @@ services:
     dockerfilePath: Dockerfile
     schedule: "0 2 * * *"   # daily at 02:00 UTC — change as needed
     plan: starter
-    # run the ingest script
+
+    # simple array-form command for the cron job
     command: ["python", "ingest_shoot.py"]
 
     envVars:
