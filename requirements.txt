@@ -1,0 +1,10 @@
+flask
+flask-cors
+boto3
+face_recognition
+pillow
+gunicorn
+redis
+rq
+numpy
+psutil

@@ -1,0 +1,1076 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Face Recognition Image Matcher — Matches</title>
+
+  <!-- Tailwind CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Custom Tailwind Config -->
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          animation: {
+            'fade-in': 'fadeIn 0.5s ease-in-out',
+            'slide-up': 'slideUp 0.4s ease-out',
+            'pulse-glow': 'pulseGlow 2s infinite',
+            'bounce-subtle': 'bounceSubtle 0.6s ease-out',
+          },
+          keyframes: {
+            fadeIn: {
+              '0%': { opacity: '0', transform: 'translateY(10px)' },
+              '100%': { opacity: '1', transform: 'translateY(0)' }
+            },
+            slideUp: {
+              '0%': { opacity: '0', transform: 'translateY(20px)' },
+              '100%': { opacity: '1', transform: 'translateY(0)' }
+            },
+            pulseGlow: {
+              '0%, 100%': { boxShadow: '0 0 5px rgba(14, 165, 233, 0.3)' },
+              '50%': { boxShadow: '0 0 20px rgba(14, 165, 233, 0.6)' }
+            },
+            bounceSubtle: {
+              '0%, 20%, 50%, 80%, 100%': { transform: 'translateY(0)' },
+              '40%': { transform: 'translateY(-5px)' },
+              '60%': { transform: 'translateY(-3px)' }
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <style>
+    /* Enhanced custom styles */
+    :root {
+      --card-radius: 1.25rem;
+      --shadow-soft: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      --shadow-medium: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+      --shadow-large: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+      --gradient-primary: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+      --gradient-success: linear-gradient(135deg, #10b981 0%, #059669 100%);
+      --gradient-bg: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+    }
+
+    body {
+      background: var(--gradient-bg);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    .image-preview { 
+      max-width: 280px; 
+      max-height: 280px; 
+      object-fit: contain; 
+      border-radius: 0.75rem;
+      transition: all 0.3s ease;
+    }
+    
+    .image-preview:hover {
+      transform: scale(1.02);
+      box-shadow: var(--shadow-medium);
+    }
+
+    .matched-image { 
+      width: 100%; 
+      height: 220px; 
+      object-fit: cover; 
+      border-radius: 0.75rem;
+      transition: all 0.3s ease;
+    }
+    
+    .matched-image:hover {
+      transform: scale(1.05);
+    }
+
+    .glass-effect {
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .input-enhanced {
+      transition: all 0.2s ease;
+      border: 2px solid transparent;
+    }
+    
+    .input-enhanced:focus {
+      border-color: #0ea5e9;
+      box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.1);
+      transform: translateY(-1px);
+    }
+
+    .button-enhanced {
+      position: relative;
+      overflow: hidden;
+      transition: all 0.3s ease;
+    }
+    
+    .button-enhanced:hover {
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-medium);
+    }
+    
+    .button-enhanced::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: -100%;
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+      transition: left 0.5s;
+    }
+    
+    .button-enhanced:hover::before {
+      left: 100%;
+    }
+
+    .card-enhanced {
+      background: rgba(255, 255, 255, 0.98);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      box-shadow: var(--shadow-soft);
+      transition: all 0.3s ease;
+    }
+    
+    .card-enhanced:hover {
+      transform: translateY(-4px);
+      box-shadow: var(--shadow-large);
+    }
+
+    .progress-bar {
+      background: linear-gradient(90deg, #0ea5e9, #06b6d4, #10b981);
+      background-size: 200% 100%;
+      animation: progressShimmer 2s linear infinite;
+    }
+
+    @keyframes progressShimmer {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+
+    .upload-area {
+      border: 2px dashed #cbd5e1;
+      transition: all 0.3s ease;
+    }
+    
+    .upload-area.drag-over {
+      border-color: #0ea5e9;
+      background-color: rgba(14, 165, 233, 0.05);
+      transform: scale(1.02);
+    }
+
+    .toast {
+      position: fixed;
+      top: 1rem;
+      right: 1rem;
+      z-index: 60;
+      max-width: 400px;
+    }
+
+    .match-card {
+      transform: translateY(20px);
+      opacity: 0;
+      animation: slideUp 0.5s ease-out forwards;
+    }
+
+    .match-card:nth-child(1) { animation-delay: 0.1s; }
+    .match-card:nth-child(2) { animation-delay: 0.2s; }
+    .match-card:nth-child(3) { animation-delay: 0.3s; }
+    .match-card:nth-child(4) { animation-delay: 0.4s; }
+    .match-card:nth-child(5) { animation-delay: 0.5s; }
+    .match-card:nth-child(6) { animation-delay: 0.6s; }
+
+    /* Loading skeleton */
+    .skeleton {
+      background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+      background-size: 200% 100%;
+      animation: loading 1.5s infinite;
+    }
+
+    @keyframes loading {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+
+    /* Custom scrollbar */
+    ::-webkit-scrollbar {
+      width: 8px;
+    }
+    
+    ::-webkit-scrollbar-track {
+      background: #f1f5f9;
+      border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 4px;
+    }
+    
+    ::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+    }
+  </style>
+</head>
+<body class="text-gray-800 antialiased min-h-screen">
+  <!-- Background Pattern -->
+  <div class="fixed inset-0 -z-10">
+    <div class="absolute inset-0 bg-gradient-to-br from-blue-50 via-white to-cyan-50"></div>
+    <div class="absolute inset-0 bg-[url('data:image/svg+xml,%3Csvg width="60" height="60" viewBox="0 0 60 60" xmlns="http://www.w3.org/2000/svg"%3E%3Cg fill="none" fill-rule="evenodd"%3E%3Cg fill="%23e2e8f0" fill-opacity="0.3"%3E%3Ccircle cx="7" cy="7" r="1"/%3E%3C/g%3E%3C/g%3E%3C/svg%3E')] opacity-50"></div>
+  </div>
+
+  <div class="min-h-screen flex items-start justify-center py-8 px-4 sm:px-6 lg:px-8">
+    <div class="w-full max-w-7xl">
+
+      <!-- Enhanced Header -->
+      <header class="mb-8 animate-fade-in">
+        <div class="glass-effect p-8 rounded-[var(--card-radius)] shadow-lg border border-white/20">
+          <div class="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-6">
+            <div class="flex-1">
+              <div class="flex items-center gap-4 mb-3">
+                <div class="w-12 h-12 bg-gradient-to-br from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center shadow-lg">
+                  <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+                  </svg>
+                </div>
+                <h1 class="text-3xl sm:text-4xl font-bold bg-gradient-to-r from-blue-600 to-cyan-600 bg-clip-text text-transparent">
+                  Face Recognition Image Matcher
+                </h1>
+              </div>
+              <p class="text-gray-600 text-lg max-w-2xl leading-relaxed">
+                Match your selfie with event photos using advanced AI — fast, secure and incredibly easy.
+              </p>
+            </div>
+            <div class="flex flex-col sm:flex-row items-start sm:items-center gap-4">
+              <div class="text-right">
+                <p class="text-sm text-gray-500 mb-1">Status</p>
+                <div class="flex items-center gap-2">
+                  <div class="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
+                  <p id="topStatus" class="text-sm font-semibold text-gray-700">Ready to match</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <!-- Enhanced Main Card -->
+      <main class="glass-effect rounded-[var(--card-radius)] shadow-xl border border-white/20 animate-slide-up">
+        
+        <!-- Progress Indicator -->
+        <div id="progressBar" class="hidden h-1 bg-gray-200 rounded-t-[var(--card-radius)] overflow-hidden">
+          <div class="h-full progress-bar w-0 transition-all duration-300"></div>
+        </div>
+
+        <div class="p-8 space-y-8">
+          <!-- Enhanced Form -->
+          <section aria-labelledby="form-heading">
+            <h2 id="form-heading" class="sr-only">Submit selfie to find matches</h2>
+
+            <form id="matchForm" class="grid grid-cols-1 lg:grid-cols-3 gap-8 items-start" autocomplete="off" novalidate>
+              <!-- Left column: inputs -->
+              <div class="space-y-6 lg:col-span-2">
+                
+                <!-- Shoot Selection -->
+                <div class="space-y-2">
+                  <label for="shootSelect" class="block text-sm font-semibold text-gray-700 mb-2">
+                    📸 Select Photo Shoot
+                  </label>
+                  <select id="shootSelect" aria-label="Select shoot" class="input-enhanced w-full rounded-xl border-gray-200 p-4 text-gray-800 shadow-sm focus:ring-2 focus:ring-blue-500" required>
+                    <option value="">🔄 Loading shoots…</option>
+                  </select>
+                </div>
+
+                <!-- Personal Information -->
+                <div class="space-y-4">
+                  <h3 class="text-lg font-semibold text-gray-800 flex items-center gap-2">
+                    👤 Personal Information
+                  </h3>
+                  <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label for="nameInput" class="block text-sm font-medium text-gray-700 mb-2">Full Name</label>
+                      <input id="nameInput" name="name" type="text" autocomplete="name" 
+                             placeholder="Enter your full name" 
+                             class="input-enhanced w-full rounded-xl border-gray-200 p-4 text-gray-800 shadow-sm" required />
+                    </div>
+                    <div>
+                      <label for="phoneInput" class="block text-sm font-medium text-gray-700 mb-2">Phone Number</label>
+                      <input id="phoneInput" name="phone" type="tel" inputmode="tel" 
+                             placeholder="+91 7XXXXXXXXX" 
+                             class="input-enhanced w-full rounded-xl border-gray-200 p-4 text-gray-800 shadow-sm" required />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label for="emailInput" class="block text-sm font-medium text-gray-700 mb-2">Email Address</label>
+                    <input id="emailInput" name="email" type="email" autocomplete="email" 
+                           placeholder="your@email.com" 
+                           class="input-enhanced w-full rounded-xl border-gray-200 p-4 text-gray-800 shadow-sm" required />
+                  </div>
+                </div>
+
+                <!-- Selfie Upload -->
+                <div class="space-y-4">
+                  <h3 class="text-lg font-semibold text-gray-800 flex items-center gap-2">
+                    📷 Upload Your Selfie
+                  </h3>
+                  <div>
+                    <label for="selfieInput" class="block text-sm font-medium text-gray-700 mb-2">Choose Image File</label>
+                    <input id="selfieInput" name="selfie" type="file" accept="image/*" 
+                           class="input-enhanced w-full rounded-xl border-gray-200 p-4 text-gray-600 shadow-sm file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100" 
+                           aria-describedby="selfieHelp" />
+                    <p id="selfieName" class="mt-2 text-sm text-gray-600 font-medium" aria-live="polite"></p>
+                    <p id="selfieHelp" class="mt-2 text-sm text-gray-500 flex items-center gap-2">
+                      💡 <span>Best results with a clear frontal selfie (no sunglasses or masks).</span>
+                    </p>
+                  </div>
+                </div>
+
+                <!-- Action Buttons -->
+                <div class="flex flex-col sm:flex-row items-start sm:items-center gap-4 pt-4">
+                  <button id="submitBtn" type="submit" 
+                          class="button-enhanced bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-700 hover:to-cyan-700 text-white font-semibold rounded-xl px-8 py-4 focus:outline-none focus:ring-4 focus:ring-blue-300 flex items-center gap-3 shadow-lg min-w-[200px] justify-center" 
+                          aria-live="polite">
+                    <svg id="submitIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                    </svg>
+                    <span id="submitText">Find My Photos</span>
+                  </button>
+
+                  <button id="clearBtn" type="button" 
+                          class="button-enhanced bg-white border-2 border-gray-200 hover:border-gray-300 hover:bg-gray-50 text-gray-700 font-medium rounded-xl px-6 py-4 flex items-center gap-2 shadow-sm">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                    </svg>
+                    Clear Form
+                  </button>
+
+                  <button id="exampleBtn" type="button" 
+                          class="button-enhanced bg-amber-50 border-2 border-amber-200 hover:border-amber-300 hover:bg-amber-100 text-amber-700 font-medium rounded-xl px-6 py-4 flex items-center gap-2 shadow-sm">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+                    </svg>
+                    Try Example
+                  </button>
+                </div>
+              </div>
+
+              <!-- Right column: enhanced preview -->
+              <div class="flex flex-col items-center space-y-6">
+                <div class="w-full upload-area rounded-2xl p-6 text-center bg-gradient-to-br from-gray-50 to-gray-100 min-h-[300px] flex flex-col justify-center">
+                  <div class="mb-4">
+                    <div class="w-16 h-16 mx-auto bg-gradient-to-br from-blue-100 to-cyan-100 rounded-2xl flex items-center justify-center mb-4">
+                      <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                      </svg>
+                    </div>
+                    <p class="text-lg font-semibold text-gray-700 mb-2">Selfie Preview</p>
+                  </div>
+                  
+                  <img id="preview" class="image-preview mx-auto hidden shadow-lg" alt="Selfie preview" />
+                  <div id="previewPlaceholder" class="text-gray-500">
+                    <p class="text-lg mb-2">📸 No selfie selected</p>
+                    <p class="text-sm">Upload a clear photo to see preview</p>
+                  </div>
+                </div>
+
+                <!-- Tips Card -->
+                <div class="w-full bg-gradient-to-br from-blue-50 to-cyan-50 rounded-2xl p-6 border border-blue-100">
+                  <h4 class="font-semibold text-blue-800 mb-3 flex items-center gap-2">
+                    💡 Tips for Best Results
+                  </h4>
+                  <ul class="text-sm text-blue-700 space-y-2">
+                    <li class="flex items-start gap-2">
+                      <span class="text-blue-500">•</span>
+                      <span>Use good lighting and clear image quality</span>
+                    </li>
+                    <li class="flex items-start gap-2">
+                      <span class="text-blue-500">•</span>
+                      <span>Face the camera directly</span>
+                    </li>
+                    <li class="flex items-start gap-2">
+                      <span class="text-blue-500">•</span>
+                      <span>Remove sunglasses or masks</span>
+                    </li>
+                    <li class="flex items-start gap-2">
+                      <span class="text-blue-500">•</span>
+                      <span>Keep a neutral expression</span>
+                    </li>
+                  </ul>
+                </div>
+              </div>
+            </form>
+          </section>
+
+          <!-- Enhanced Status / results header -->
+          <section id="resultsHeader" class="hidden animate-slide-up">
+            <div class="bg-gradient-to-r from-green-50 to-emerald-50 rounded-2xl p-6 border border-green-200">
+              <div class="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-6">
+                <div class="flex-1">
+                  <div class="flex items-center gap-3 mb-2">
+                    <div class="w-8 h-8 bg-green-500 rounded-full flex items-center justify-center">
+                      <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+                      </svg>
+                    </div>
+                    <h3 class="text-xl font-bold text-gray-800" id="resultsTitle">Found 0 matches</h3>
+                  </div>
+                  <p id="resultsMessage" class="text-gray-600"></p>
+                </div>
+
+                <div class="flex flex-wrap items-center gap-3">
+                  <a id="zipLink" class="hidden button-enhanced bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white px-6 py-3 rounded-xl text-sm font-semibold flex items-center gap-2 shadow-lg" 
+                     target="_blank" rel="noopener noreferrer" aria-label="Download all matched images as zip">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-4-4m4 4l4-4m-6 4h.01M5 20h14a2 2 0 002-2V8a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
+                    </svg>
+                    Download All (ZIP)
+                  </a>
+
+                  <a id="shareFolder" class="hidden button-enhanced bg-white border-2 border-gray-200 text-gray-700 px-6 py-3 rounded-xl text-sm font-semibold flex items-center gap-2 shadow-sm" 
+                     target="_blank" rel="noopener noreferrer" aria-label="Open shared folder">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z"></path>
+                    </svg>
+                    Open Folder
+                  </a>
+
+                  <button id="showDetailsBtn" class="button-enhanced bg-white border-2 border-gray-200 text-gray-700 px-6 py-3 rounded-xl text-sm font-semibold flex items-center gap-2 shadow-sm" aria-expanded="false">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    Show Details
+                  </button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Enhanced Matches grid -->
+          <section id="matchesSection" class="hidden animate-slide-up">
+            <div id="matchedImages" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6"></div>
+          </section>
+
+          <!-- Enhanced Details panel -->
+          <section id="detailsPanel" class="hidden animate-slide-up" aria-hidden="true">
+            <div class="bg-gray-50 border-2 border-gray-100 rounded-2xl p-6 shadow-inner">
+              <div class="flex items-start justify-between gap-4 mb-4">
+                <div>
+                  <h4 class="text-lg font-bold text-gray-800 flex items-center gap-2">
+                    🔍 Technical Details
+                  </h4>
+                  <p class="text-sm text-gray-600 mt-1">Raw JSON response from the face recognition API</p>
+                </div>
+                <div class="flex items-center gap-2">
+                  <button id="copyJsonBtn" class="button-enhanced text-sm px-4 py-2 bg-white border-2 border-gray-200 rounded-lg font-medium hover:border-gray-300">
+                    Copy JSON
+                  </button>
+                  <button id="closeDetailsBtn" class="button-enhanced text-sm px-4 py-2 bg-white border-2 border-gray-200 rounded-lg font-medium hover:border-gray-300">
+                    Close
+                  </button>
+                </div>
+              </div>
+
+              <pre id="jsonBox" class="text-xs font-mono p-4 bg-white rounded-xl border-2 border-gray-200 overflow-auto shadow-inner" style="max-height:300px"></pre>
+            </div>
+          </section>
+
+        </div>
+      </main>
+
+      <!-- Enhanced Footer -->
+      <footer class="mt-8 text-center text-gray-500 animate-fade-in">
+        <div class="glass-effect rounded-2xl p-6 border border-white/20">
+          <div class="flex flex-col sm:flex-row items-center justify-center gap-4">
+            <p class="flex items-center gap-2">
+              <span>Built with ❤️ for photographers</span>
+              <span class="text-gray-300">•</span>
+              <span class="font-semibold text-blue-600">FaceMatcher</span>
+            </p>
+            <div class="flex items-center gap-4 text-sm">
+              <span class="px-3 py-1 bg-green-100 text-green-700 rounded-full font-medium">AI Powered</span>
+              <span class="px-3 py-1 bg-blue-100 text-blue-700 rounded-full font-medium">Secure</span>
+              <span class="px-3 py-1 bg-purple-100 text-purple-700 rounded-full font-medium">Fast</span>
+            </div>
+          </div>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <!-- Enhanced toast container -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script>
+    // ---------- Enhanced Shortcuts ----------
+    const $ = s => document.querySelector(s);
+    const shootSelect = $('#shootSelect');
+    const nameInput = $('#nameInput');
+    const emailInput = $('#emailInput');
+    const phoneInput = $('#phoneInput');
+    const selfieInput = $('#selfieInput');
+    const preview = $('#preview');
+    const previewPlaceholder = $('#previewPlaceholder');
+    const selfieName = $('#selfieName');
+    const submitBtn = $('#submitBtn');
+    const submitText = $('#submitText');
+    const submitIcon = $('#submitIcon');
+    const clearBtn = $('#clearBtn');
+    const exampleBtn = $('#exampleBtn');
+    const topStatus = $('#topStatus');
+    const progressBar = $('#progressBar');
+
+    const resultsHeader = $('#resultsHeader');
+    const resultsTitle = $('#resultsTitle');
+    const resultsMessage = $('#resultsMessage');
+    const matchesSection = $('#matchesSection');
+    const matchedImages = $('#matchedImages');
+    const zipLink = $('#zipLink');
+    const shareFolder = $('#shareFolder');
+    const showDetailsBtn = $('#showDetailsBtn');
+    const detailsPanel = $('#detailsPanel');
+    const jsonBox = $('#jsonBox');
+    const copyJsonBtn = $('#copyJsonBtn');
+    const closeDetailsBtn = $('#closeDetailsBtn');
+    const toastDiv = $('#toast');
+
+    let lastResponse = null;
+
+    // ---------- Enhanced Helper Functions ----------
+    function humanFilename(key) {
+      try { return key.split('/').pop(); } catch (e) { return key; }
+    }
+
+    function setTopStatus(txt) { 
+      topStatus.textContent = txt;
+      topStatus.parentElement.classList.add('animate-bounce-subtle');
+      setTimeout(() => {
+        topStatus.parentElement.classList.remove('animate-bounce-subtle');
+      }, 600);
+    }
+
+    function toast(msg, type='info', ms=4000) {
+      toastDiv.classList.remove('hidden');
+      const bgColor = type === 'error' ? 'bg-red-500' : type === 'success' ? 'bg-green-500' : 'bg-blue-500';
+      const icon = type === 'error' ? '❌' : type === 'success' ? '✅' : 'ℹ️';
+      
+      toastDiv.innerHTML = `
+        <div class="glass-effect ${bgColor} text-white px-6 py-4 rounded-2xl shadow-lg border border-white/20 animate-slide-up">
+          <div class="flex items-center gap-3">
+            <span class="text-lg">${icon}</span>
+            <span class="font-medium">${msg}</span>
+          </div>
+        </div>
+      `;
+      setTimeout(() => { 
+        toastDiv.classList.add('hidden'); 
+      }, ms);
+    }
+
+    function showProgress(percentage) {
+      progressBar.classList.remove('hidden');
+      const bar = progressBar.querySelector('div');
+      bar.style.width = percentage + '%';
+    }
+
+    function hideProgress() {
+      progressBar.classList.add('hidden');
+      const bar = progressBar.querySelector('div');
+      bar.style.width = '0%';
+    }
+
+    function toggleLoading(on) {
+      if (on) {
+        submitBtn.disabled = true;
+        submitBtn.classList.add('opacity-75', 'cursor-not-allowed');
+        submitIcon.outerHTML = `
+          <svg id="submitIcon" class="w-5 h-5 animate-spin" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" class="opacity-25" stroke-width="4" fill="none"></circle>
+            <path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"></path>
+          </svg>
+        `;
+        submitText.textContent = 'Searching...';
+        showProgress(20);
+      } else {
+        submitBtn.disabled = false;
+        submitBtn.classList.remove('opacity-75', 'cursor-not-allowed');
+        submitIcon.outerHTML = `
+          <svg id="submitIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+          </svg>
+        `;
+        submitText.textContent = 'Find My Photos';
+        hideProgress();
+      }
+    }
+
+    function resetFormUI() {
+      preview.src = '';
+      preview.classList.add('hidden');
+      previewPlaceholder.classList.remove('hidden');
+      selfieName.textContent = '';
+      matchedImages.innerHTML = '';
+      resultsHeader.classList.add('hidden');
+      matchesSection.classList.add('hidden');
+      detailsPanel.classList.add('hidden');
+      zipLink.classList.add('hidden');
+      shareFolder.classList.add('hidden');
+      jsonBox.textContent = '';
+      lastResponse = null;
+      hideProgress();
+    }
+
+    // ---------- Enhanced drag and drop ----------
+    const uploadArea = document.querySelector('.upload-area');
+    
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+      uploadArea.addEventListener(eventName, preventDefaults, false);
+    });
+
+    function preventDefaults(e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+
+    ['dragenter', 'dragover'].forEach(eventName => {
+      uploadArea.addEventListener(eventName, highlight, false);
+    });
+
+    ['dragleave', 'drop'].forEach(eventName => {
+      uploadArea.addEventListener(eventName, unhighlight, false);
+    });
+
+    function highlight(e) {
+      uploadArea.classList.add('drag-over');
+    }
+
+    function unhighlight(e) {
+      uploadArea.classList.remove('drag-over');
+    }
+
+    uploadArea.addEventListener('drop', handleDrop, false);
+
+    function handleDrop(e) {
+      const dt = e.dataTransfer;
+      const files = dt.files;
+      if (files.length > 0) {
+        selfieInput.files = files;
+        selfieInput.dispatchEvent(new Event('change'));
+      }
+    }
+
+    // ---------- Load shoots from backend ----------
+    async function populateShoots() {
+      try {
+        shootSelect.innerHTML = '<option value="">🔄 Loading shoots...</option>';
+        const res = await fetch('/shoots');
+        const data = await res.json();
+        shootSelect.innerHTML = '';
+        if (data && data.success && Array.isArray(data.shoots) && data.shoots.length) {
+          data.shoots.forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s.shoot_id;
+            opt.textContent = `📸 ${s.shoot_id}${s.has_embeddings ? '' : ' (processing...)'}`;
+            shootSelect.appendChild(opt);
+          });
+          shootSelect.selectedIndex = 0;
+          toast('Photo shoots loaded successfully', 'success', 2000);
+        } else {
+          shootSelect.innerHTML = '<option value="">❌ No shoots found</option>';
+          toast('No photo shoots available', 'error');
+        }
+      } catch (err) {
+        console.error('Failed to load shoots', err);
+        shootSelect.innerHTML = '<option value="">❌ Error loading shoots</option>';
+        toast('Failed to load photo shoots', 'error');
+      }
+    }
+
+    // ---------- Example values for quick demo ----------
+    function populateExampleValues() {
+      nameInput.value = 'Yash Kumar';
+      emailInput.value = 'bhargavyaswanth@gmail.com';
+      phoneInput.value = '+91 7075739174';
+      selfieName.textContent = '📷 IMG20210712144356.jpg (example)';
+    }
+
+    // ---------- Enhanced Preview selfie ----------
+    selfieInput.addEventListener('change', (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) {
+        preview.src = '';
+        preview.classList.add('hidden');
+        previewPlaceholder.classList.remove('hidden');
+        selfieName.textContent = '';
+        return;
+      }
+
+      // Validate file type
+      if (!f.type.startsWith('image/')) {
+        toast('Please select a valid image file', 'error');
+        return;
+      }
+
+      // Validate file size (max 10MB)
+      if (f.size > 10 * 1024 * 1024) {
+        toast('Image file is too large. Please select a file under 10MB', 'error');
+        return;
+      }
+
+      selfieName.innerHTML = `📷 ${f.name} <span class="text-green-600 font-semibold">(${(f.size / 1024 / 1024).toFixed(2)} MB)</span>`;
+      const url = URL.createObjectURL(f);
+      preview.src = url;
+      preview.classList.remove('hidden');
+      previewPlaceholder.classList.add('hidden');
+      
+      // Add animation
+      preview.classList.add('animate-fade-in');
+      setTimeout(() => {
+        preview.classList.remove('animate-fade-in');
+      }, 500);
+
+      toast('Image preview loaded successfully', 'success', 2000);
+    });
+
+    // ---------- Enhanced Button Events ----------
+    exampleBtn.addEventListener('click', () => {
+      populateExampleValues();
+      setTopStatus('Example values loaded');
+      toast('Example data filled in successfully', 'success', 2000);
+      exampleBtn.classList.add('animate-bounce-subtle');
+      setTimeout(() => {
+        exampleBtn.classList.remove('animate-bounce-subtle');
+      }, 600);
+    });
+
+    clearBtn.addEventListener('click', () => {
+      document.getElementById('matchForm').reset();
+      resetFormUI();
+      setTopStatus('Form cleared');
+      toast('Form cleared successfully', 'info', 2000);
+    });
+
+    // ---------- Enhanced Details panel ----------
+    showDetailsBtn.addEventListener('click', () => {
+      if (!lastResponse) return;
+      const isHidden = detailsPanel.classList.toggle('hidden');
+      showDetailsBtn.setAttribute('aria-expanded', !isHidden ? 'true' : 'false');
+      if (!isHidden) {
+        jsonBox.textContent = JSON.stringify(lastResponse, null, 2);
+        detailsPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    });
+
+    closeDetailsBtn.addEventListener('click', () => {
+      detailsPanel.classList.add('hidden');
+      showDetailsBtn.setAttribute('aria-expanded', 'false');
+    });
+
+    copyJsonBtn.addEventListener('click', async () => {
+      if (!lastResponse) return;
+      try {
+        await navigator.clipboard.writeText(JSON.stringify(lastResponse, null, 2));
+        const originalText = copyJsonBtn.textContent;
+        copyJsonBtn.textContent = '✅ Copied!';
+        copyJsonBtn.classList.add('bg-green-100', 'text-green-700', 'border-green-300');
+        setTimeout(() => {
+          copyJsonBtn.textContent = originalText;
+          copyJsonBtn.classList.remove('bg-green-100', 'text-green-700', 'border-green-300');
+        }, 2000);
+        toast('JSON data copied to clipboard', 'success', 2000);
+      } catch (e) {
+        copyJsonBtn.textContent = '❌ Failed';
+        setTimeout(() => copyJsonBtn.textContent = 'Copy JSON', 2000);
+        toast('Failed to copy to clipboard', 'error');
+      }
+    });
+
+    // ---------- Enhanced Render matches ----------
+    function renderMatches(resp) {
+      lastResponse = resp;
+      matchedImages.innerHTML = '';
+
+      // Enhanced header
+      resultsTitle.textContent = `Found ${resp.matched_count} matching photo${resp.matched_count !== 1 ? 's' : ''}`;
+      resultsMessage.textContent = resp.message || 'Your matched photos are ready for download!';
+
+      // Links
+      if (resp.zip_download_url) {
+        zipLink.href = resp.zip_download_url;
+        zipLink.classList.remove('hidden');
+      } else {
+        zipLink.classList.add('hidden');
+      }
+
+      if (resp.shared_url) {
+        shareFolder.href = resp.shared_url;
+        shareFolder.classList.remove('hidden');
+      } else {
+        shareFolder.classList.add('hidden');
+      }
+
+      // Enhanced match cards
+      (resp.matches || []).forEach((m, index) => {
+        const card = document.createElement('article');
+        card.className = 'match-card card-enhanced rounded-2xl p-6 flex flex-col space-y-4';
+
+        const imgWrap = document.createElement('div');
+        imgWrap.className = 'w-full overflow-hidden rounded-xl bg-gray-100 relative group';
+        
+        const img = document.createElement('img');
+        img.className = 'matched-image w-full h-56 object-cover transition-transform duration-300 group-hover:scale-105';
+        img.src = m.presigned_url || '';
+        img.alt = humanFilename(m.key || '');
+        img.loading = 'lazy';
+        
+        // Add loading placeholder
+        img.addEventListener('load', () => {
+          img.classList.add('animate-fade-in');
+        });
+
+        imgWrap.appendChild(img);
+
+        const meta = document.createElement('div');
+        meta.className = 'flex items-start justify-between gap-3';
+
+        const left = document.createElement('div');
+        left.className = 'flex-1 min-w-0';
+        
+        const filename = document.createElement('p');
+        filename.className = 'text-sm font-bold text-gray-800 truncate mb-1';
+        filename.title = m.key || '';
+        filename.textContent = humanFilename(m.key || '');
+        
+        const fileSize = document.createElement('p');
+        fileSize.className = 'text-xs text-gray-500';
+        fileSize.textContent = '📷 High Quality Image';
+        
+        left.appendChild(filename);
+        left.appendChild(fileSize);
+
+        const badge = document.createElement('div');
+        badge.className = 'flex flex-col items-end gap-1';
+        
+        if (typeof m.distance !== 'undefined' && m.distance !== null) {
+          const d = parseFloat(m.distance);
+          const badgeEl = document.createElement('span');
+          badgeEl.className = 'inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold';
+          
+          if (d <= 0.38) {
+            badgeEl.classList.add('bg-green-100', 'text-green-800');
+            badgeEl.innerHTML = '🎯 Perfect Match';
+          } else if (d <= 0.47) {
+            badgeEl.classList.add('bg-amber-100', 'text-amber-800');
+            badgeEl.innerHTML = '👍 Good Match';
+          } else {
+            badgeEl.classList.add('bg-blue-100', 'text-blue-800');
+            badgeEl.innerHTML = '🔍 Possible Match';
+          }
+          
+          const distanceEl = document.createElement('span');
+          distanceEl.className = 'text-xs text-gray-500 font-mono';
+          distanceEl.textContent = `Score: ${(1 - d).toFixed(3)}`;
+          
+          badge.appendChild(badgeEl);
+          badge.appendChild(distanceEl);
+        }
+
+        meta.appendChild(left);
+        meta.appendChild(badge);
+
+        const actions = document.createElement('div');
+        actions.className = 'flex gap-3';
+
+        const dl = document.createElement('a');
+        dl.href = m.presigned_url || '#';
+        dl.target = '_blank';
+        dl.rel = 'noopener noreferrer';
+        dl.download = humanFilename(m.key || '');
+        dl.className = 'flex-1 button-enhanced bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-700 hover:to-cyan-700 text-white px-4 py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 shadow-lg';
+        dl.setAttribute('aria-label', `Download ${humanFilename(m.key||'')}`);
+        dl.innerHTML = `
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-4-4m4 4l4-4m-6 4h.01M5 20h14a2 2 0 002-2V8a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2z"></path>
+          </svg>
+          Download
+        `;
+
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'button-enhanced bg-white border-2 border-gray-200 hover:border-gray-300 text-gray-700 px-4 py-3 rounded-xl text-sm font-semibold flex items-center gap-2 shadow-sm';
+        copyBtn.innerHTML = `
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+          </svg>
+          Copy
+        `;
+        
+        copyBtn.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(m.presigned_url || '');
+            const originalHTML = copyBtn.innerHTML;
+            copyBtn.innerHTML = '✅ Copied!';
+            copyBtn.classList.add('bg-green-100', 'text-green-700', 'border-green-300');
+            setTimeout(() => {
+              copyBtn.innerHTML = originalHTML;
+              copyBtn.classList.remove('bg-green-100', 'text-green-700', 'border-green-300');
+            }, 2000);
+            toast('Link copied to clipboard', 'success', 2000);
+          } catch (err) {
+            toast('Failed to copy link', 'error');
+          }
+        });
+
+        actions.appendChild(dl);
+        actions.appendChild(copyBtn);
+
+        card.appendChild(imgWrap);
+        card.appendChild(meta);
+        card.appendChild(actions);
+        matchedImages.appendChild(card);
+      });
+
+      showProgress(100);
+      setTimeout(() => {
+        resultsHeader.classList.remove('hidden');
+        matchesSection.classList.remove('hidden');
+        setTopStatus('Results ready!');
+        hideProgress();
+        
+        if ((resp.matches || []).length === 0) {
+          toast('No matching photos found. Try a different selfie or check if you attended this event.', 'info', 5000);
+        } else {
+          toast(`🎉 Found ${resp.matched_count} matching photo${resp.matched_count !== 1 ? 's' : ''}! Check your email for download links.`, 'success', 5000);
+        }
+
+        // Smooth scroll to results
+        setTimeout(() => {
+          resultsHeader.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 300);
+      }, 500);
+    }
+
+    // ---------- Enhanced Submit handler ----------
+    document.getElementById('matchForm').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+
+      // Enhanced validation
+      const name = nameInput.value.trim();
+      const email = emailInput.value.trim();
+      const phone = phoneInput.value.trim();
+      const shoot = shootSelect.value;
+      const file = selfieInput.files[0];
+
+      const errors = [];
+      if (!name) errors.push('Full name is required');
+      if (!email) errors.push('Email address is required');
+      if (!phone) errors.push('Phone number is required');
+      if (!shoot) errors.push('Please select a photo shoot');
+      if (!file) errors.push('Please upload a selfie');
+
+      // Email validation
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (email && !emailRegex.test(email)) {
+        errors.push('Please enter a valid email address');
+      }
+
+      if (errors.length > 0) {
+        toast(`Please fix the following issues:\n• ${errors.join('\n• ')}`, 'error', 6000);
+        return;
+      }
+
+      // Enhanced UI feedback
+      toggleLoading(true);
+      toast('Starting search...', 'info', 2000);
+      setTopStatus('Analyzing your selfie...');
+      matchedImages.innerHTML = '';
+      resultsHeader.classList.add('hidden');
+      matchesSection.classList.add('hidden');
+      zipLink.classList.add('hidden');
+      shareFolder.classList.add('hidden');
+
+      // Progress simulation
+      showProgress(30);
+      setTimeout(() => showProgress(60), 1000);
+
+      // Process image
+      const reader = new FileReader();
+      reader.onerror = () => {
+        toggleLoading(false); // Ensure loading stops on error
+        hideProgress();
+        toast('Failed to read image file. Please try again.', 'error');
+        setTopStatus('Ready to match');
+      };
+      reader.onload = async () => {
+        try {
+          const base64 = reader.result.split(',')[1];
+          showProgress(80);
+          setTopStatus('Pending...');
+          
+          const res = await fetch('/match', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name, email, phone,
+              shoot_id: shoot,
+              selfie: base64
+            })
+          });
+
+          showProgress(90);
+          const data = await res.json();
+          showProgress(100);
+
+          if (!res.ok) {
+            toggleLoading(false); // Ensure loading stops on error
+            setTopStatus('Search failed');
+            toast(data.message || 'Server error occurred. Please try again.', 'error', 5000);
+            lastResponse = data;
+            jsonBox.textContent = JSON.stringify(data, null, 2);
+            hideProgress();
+          } else {
+            toggleLoading(false); // Ensure loading stops on success
+            toast('Data received successfully!', 'success', 2000);
+            renderMatches(data);
+          }
+        } catch (err) {
+          toggleLoading(false); // Ensure loading stops on network error
+          console.error(err);
+          toast('Network error. Please check your connection and try again.', 'error', 5000);
+          setTopStatus('Connection failed');
+          hideProgress();
+        }
+      };
+      
+      reader.readAsDataURL(file);
+    });
+
+    // ---------- Enhanced Input animations ----------
+    [nameInput, emailInput, phoneInput].forEach(input => {
+      input.addEventListener('focus', () => {
+        input.classList.add('animate-pulse-glow');
+      });
+      
+      input.addEventListener('blur', () => {
+        input.classList.remove('animate-pulse-glow');
+      });
+    });
+
+    // ---------- Initialize ----------
+    document.addEventListener('DOMContentLoaded', () => {
+      populateShoots();
+      setTopStatus('Ready to find your photos');
+      
+      // Add welcome message
+      setTimeout(() => {
+        toast('👋 Welcome! Upload your selfie to find your photos from the event.', 'info', 4000);
+      }, 1000);
+    });
+
+  </script>
+</body>
+</html>

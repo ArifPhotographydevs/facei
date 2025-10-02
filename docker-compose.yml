@@ -1,0 +1,59 @@
+version: "3.8"
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  web:
+    build: .
+    command: gunicorn --workers 1 --bind 0.0.0.0:5000 app:app
+    ports:
+      - "5000:5000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      ACCESS_KEY: SW5I2XCNJAI7GTB7MRIW
+      SECRET_KEY: eKNEI3erAhnSiBdcK0OltkTHIe2jJYJVhPu1eazJ
+      BUCKET: arif12
+      REGION: ap-northeast-1
+      ENDPOINT_URL: https://s3.ap-northeast-1.wasabisys.com
+    depends_on:
+      - redis
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  worker:
+    build: .
+    command: rq worker --url redis://redis:6379 face
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      ACCESS_KEY: SW5I2XCNJAI7GTB7MRIW
+      SECRET_KEY: eKNEI3erAhnSiBdcK0OltkTHIe2jJYJVhPu1eazJ
+      BUCKET: arif12
+      REGION: ap-northeast-1
+      ENDPOINT_URL: https://s3.ap-northeast-1.wasabisys.com
+      SHOOT_EMB_CACHE_TTL: 600
+    depends_on:
+      - redis
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  ingest:
+    build: .
+    command: python ingest_shoot.py
+    environment:
+      ACCESS_KEY: SW5I2XCNJAI7GTB7MRIW
+      SECRET_KEY: eKNEI3erAhnSiBdcK0OltkTHIe2jJYJVhPu1eazJ
+      BUCKET: arif12
+      REGION: ap-northeast-1
+      ENDPOINT_URL: https://s3.ap-northeast-1.wasabisys.com
+    deploy:
+      resources:
+        limits:
+          memory: 2G
