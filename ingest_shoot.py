@@ -1,344 +1,444 @@
 #!/usr/bin/env python3
 """
-Robust ingest_shoot script - improved error handling, resource controls, and logging.
+ingest_shoot.py
 
-Replaces the original ingest script with:
-- safer image size checks and resizing
-- bounded process pool sized to CPU (with cap) to avoid native heap corruption
-- deterministic closing of file-like objects
-- defensive handling of S3 download/upload failures
-- explicit logging of memory usage and progress
-- consistent returns from process_image to avoid breaking the aggregator loop
+Robust ingest + built-in scheduler/watchdog suitable for running inside Docker.
+
+Features:
+- Limits native thread usage BEFORE importing numpy/PIL/face_recognition
+- Uses multiprocessing spawn start method to avoid fork-related corruption
+- Per-worker s3 client initialization
+- Worker isolation via ProcessPoolExecutor; synchronous fallback if workers crash
+- Chunked processing to reduce memory pressure
+- Writes embeddings.npz back to S3
+- Built-in scheduler/watchdog mode with exponential backoff and graceful shutdown
+- By default (no CLI args) runs the scheduler loop so container doesn't exit immediately
+- Configurable via environment variables:
+    INGEST_MAX_WORKERS (default 2)
+    INGEST_IMAGE_MAX_DIM (default 1600)
+    INGEST_INTERVAL_SECONDS (default 300)
+    INGEST_BACKOFF_BASE (default 5)
+    S3_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_ENDPOINT
+    INGEST_DAEMON=true to run scheduler by env
 """
 
-# --- IMPORTANT: limit native threads BEFORE importing numpy/PIL/face_recognition ---
+# ---------------------------
+# IMPORTANT: limit native thread env vars BEFORE importing native libs
+# ---------------------------
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 
-# Reduce native parallelism to avoid native-thread / heap corruption issues in C extensions.
-# Must be set before importing numpy, Pillow, face_recognition, or other native libs.
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-
-import io
-import tempfile
-import logging
-import numpy as np
-from PIL import Image, ImageFile
-import face_recognition
-from helpers import s3, BUCKET
-from botocore.exceptions import ClientError, EndpointConnectionError
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import psutil
-import multiprocessing
+# standard libs
+import sys
 import time
-from typing import Tuple, Optional, List
+import uuid
+import signal
+import logging
+import tempfile
+import traceback
+import argparse
+from typing import Optional, Tuple, List
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 
-# PIL can raise "OSError: image file is truncated" on some files; enabling LOAD_TRUNCATED_IMAGES helps.
+# set spawn start method early (helps avoid fork/native lib problems)
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except Exception:
+    pass
+
+# now safe to import heavy native libs
+import io
+import numpy as np
+from PIL import Image, ImageFile, UnidentifiedImageError
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ingest-shoot")
+import face_recognition
+import psutil
+import boto3
+from botocore.exceptions import ClientError, EndpointConnectionError
+from botocore.config import Config
 
-# Configuration - tune these if necessary
-MAX_PIXELS = 4000 * 4000            # reject images with more than 16,000,000 pixels (approx 16MP)
-THUMBNAIL_SIZE = (1024, 1024)       # downscale images to this box for face recognition
-JPEG_QUALITY = 85
-MAX_WORKERS_CAP = 1                 # conservative default to avoid memory/native issues; raise if you have RAM
-S3_DOWNLOAD_RETRIES = 2
-S3_UPLOAD_RETRIES = 2
-S3_TIMEOUT_SECONDS = 30             # if your boto3 config uses connect/read timeouts, set them there
+# -------------- Logging --------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logger = logging.getLogger("ingest-multiface")
 
-def list_shoots() -> List[str]:
-    """
-    List shoot IDs under projects/gallery/ in the S3 bucket.
-    Returns sorted list of shoot ids (strings).
-    """
+# -------------- Configuration (via env or defaults) --------------
+BUCKET = os.environ.get("S3_BUCKET", "arif12")
+AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", os.environ.get("ACCESS_KEY", ""))
+AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", os.environ.get("SECRET_KEY", ""))
+AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", f"https://s3.{AWS_REGION}.wasabisys.com")
+BOTO_MAX_POOL = int(os.environ.get("BOTO_MAX_POOL", "50"))
+
+MAX_WORKERS = max(1, int(os.environ.get("INGEST_MAX_WORKERS", "2")))
+IMAGE_MAX_DIM = int(os.environ.get("INGEST_IMAGE_MAX_DIM", "1600"))
+FUTURE_TIMEOUT = int(os.environ.get("INGEST_FUTURE_TIMEOUT", "300"))
+CHUNK_MULTIPLIER = int(os.environ.get("INGEST_CHUNK_MULTIPLIER", "4"))
+RETRIES_PER_IMAGE = int(os.environ.get("INGEST_RETRIES_PER_IMAGE", "1"))
+S3_PAGE_SIZE = int(os.environ.get("INGEST_S3_PAGE_SIZE", "1000"))
+
+# Scheduler config
+INGEST_INTERVAL_SECONDS = int(os.environ.get("INGEST_INTERVAL_SECONDS", "300"))  # poll every 5 minutes by default
+INGEST_BACKOFF_BASE = int(os.environ.get("INGEST_BACKOFF_BASE", "5"))  # base seconds for exponential backoff
+INGEST_DAEMON = os.environ.get("INGEST_DAEMON", "false").lower() in ("1", "true", "yes")
+
+# S3 client factory
+def create_s3_client():
+    cfg = Config(max_pool_connections=BOTO_MAX_POOL)
+    return boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY or None,
+        aws_secret_access_key=AWS_SECRET_KEY or None,
+        region_name=AWS_REGION,
+        endpoint_url=S3_ENDPOINT,
+        config=cfg
+    )
+
+# global s3 client for main process
+s3 = create_s3_client()
+
+# per-worker s3 in initializer
+_worker_s3 = None
+def _worker_init():
+    global _worker_s3
+    # re-ensure env thread limits in worker
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    _worker_s3 = create_s3_client()
+
+# ----------------- Utility functions -----------------
+def list_shoots(prefix: str = "projects/gallery/") -> List[str]:
     try:
-        prefix = "projects/gallery/"
         paginator = s3.get_paginator('list_objects_v2')
-        page_iterator = paginator.paginate(Bucket=BUCKET, Prefix=prefix, Delimiter='/')
-        shoots = []
+        shoots = set()
+        page_iterator = paginator.paginate(Bucket=BUCKET, Prefix=prefix, Delimiter='/', PaginationConfig={'PageSize': S3_PAGE_SIZE})
         for page in page_iterator:
             for cp in page.get("CommonPrefixes", []):
                 p = cp.get("Prefix", "")
                 if p.startswith(prefix):
-                    shoot_id = p[len(prefix):].rstrip('/')
-                    if shoot_id:
-                        shoots.append(shoot_id)
+                    sid = p[len(prefix):].rstrip('/')
+                    if sid:
+                        shoots.add(sid)
+        if not shoots:
+            # fallback
+            page_iterator = paginator.paginate(Bucket=BUCKET, Prefix=prefix, PaginationConfig={'PageSize': S3_PAGE_SIZE})
+            for page in page_iterator:
+                for obj in page.get("Contents", []):
+                    key = obj.get("Key")
+                    if key and key.startswith(prefix):
+                        remaining = key[len(prefix):]
+                        parts = remaining.split('/')
+                        if parts and parts[0]:
+                            shoots.add(parts[0])
         return sorted(shoots)
-    except ClientError as e:
-        logger.exception(f"Failed to list shoots: {e}")
-        return []
     except Exception as e:
-        logger.exception(f"Unexpected error listing shoots: {e}")
+        logger.exception("list_shoots failed: %s", e)
         return []
 
 def list_shoot_keys(shoot_id: str) -> List[str]:
-    """
-    Return a sorted list of image keys (jpg/jpeg/png) for the shoot.
-    """
+    prefix = f"projects/gallery/{shoot_id}/"
+    keys = []
     try:
-        prefix = f"projects/gallery/{shoot_id}/"
         paginator = s3.get_paginator('list_objects_v2')
-        keys = []
-        for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+        for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix, PaginationConfig={'PageSize': S3_PAGE_SIZE}):
             for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.lower().endswith((".jpg", ".jpeg", ".png")):
-                    keys.append(key)
-        logger.info(f"Found {len(keys)} images for shoot {shoot_id} at prefix {prefix}")
-        return sorted(keys)
-    except ClientError as e:
-        logger.exception(f"Failed to list keys for shoot {shoot_id}: {e}")
-        return []
+                k = obj.get("Key")
+                if k and not k.endswith('/') and k.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff")):
+                    keys.append(k)
     except Exception as e:
-        logger.exception(f"Unexpected error listing keys for shoot {shoot_id}: {e}")
-        return []
+        logger.exception("list_shoot_keys failed for %s: %s", shoot_id, e)
+    logger.info("Found %d images for shoot %s", len(keys), shoot_id)
+    return sorted(keys)
 
-def download_to_bytes(key: str) -> Optional[io.BytesIO]:
-    """
-    Download S3 object into a BytesIO and return it. Retries a few times for transient errors.
-    Caller must close the returned BytesIO when finished.
-    """
+def download_to_bytesio(client, key: str, attempts: int = 2) -> Optional[io.BytesIO]:
     attempt = 0
-    while attempt <= S3_DOWNLOAD_RETRIES:
+    while attempt < attempts:
         attempt += 1
         try:
             bio = io.BytesIO()
-            s3.download_fileobj(Bucket=BUCKET, Key=key, Fileobj=bio)
+            client.download_fileobj(Bucket=BUCKET, Key=key, Fileobj=bio)
             bio.seek(0)
             return bio
         except EndpointConnectionError as e:
-            logger.warning(f"S3 endpoint connection error while downloading {key} (attempt {attempt}): {e}")
+            logger.warning("S3 endpoint error for %s attempt %d: %s", key, attempt, e)
         except ClientError as e:
-            logger.exception(f"S3 client error downloading {key} (attempt {attempt}): {e}")
-            # If it's a 404 / NoSuchKey, no point in retrying
-            if getattr(e, 'response', {}).get('Error', {}).get('Code') in ('NoSuchKey', '404'):
+            logger.warning("S3 client error for %s attempt %d: %s", key, attempt, e)
+            code = e.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey"):
                 break
         except Exception as e:
-            logger.exception(f"Unexpected error downloading {key} (attempt {attempt}): {e}")
+            logger.exception("Unexpected download error for %s attempt %d: %s", key, attempt, e)
         time.sleep(1 * attempt)
     return None
 
-def _safe_load_pil(bio: io.BytesIO) -> Optional[Image.Image]:
-    """
-    Load an image via PIL from BytesIO. Returns a PIL.Image or None.
-    This function clones the bytes into a new BytesIO because face_recognition and PIL sometimes
-    move the stream pointer.
-    """
+def safe_load_pil_from_bytes(bio: io.BytesIO) -> Optional[Image.Image]:
     try:
         bio.seek(0)
-        # create a copy to avoid pointer issues
-        tmp = io.BytesIO(bio.read())
-        tmp.seek(0)
-        img = Image.open(tmp)
+        dup = io.BytesIO(bio.read())
+        dup.seek(0)
+        img = Image.open(dup)
         return img
     except Exception as e:
-        logger.warning(f"Failed to open image via PIL: {e}")
+        logger.debug("safe_load_pil_from_bytes failed: %s", e)
         return None
 
-def compute_embedding_from_image(pil_img: Image.Image) -> Optional[np.ndarray]:
-    """
-    Given a PIL.Image (RGB), compute the first face embedding (128-d float32) or return None.
-    """
+def resize_image_in_memory(img: Image.Image, max_dim: int = IMAGE_MAX_DIM) -> Image.Image:
     try:
-        # convert PIL image to numpy array expected by face_recognition
-        arr = np.asarray(pil_img.convert('RGB'))
-        # First detect face locations (quicker) then compute encodings
-        locations = face_recognition.face_locations(arr, model='hog')  # 'hog' is faster; 'cnn' is more accurate if GPU available
-        if not locations:
-            return None
-        encs = face_recognition.face_encodings(arr, known_face_locations=locations)
+        w, h = img.size
+        if max(w, h) <= max_dim:
+            return img
+        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        return img
+    except Exception:
+        return img
+
+# worker function (picklable)
+def worker_process_image(key: str) -> Tuple[Optional[str], Optional[np.ndarray], Optional[str]]:
+    global _worker_s3
+    try:
+        if _worker_s3 is None:
+            _worker_s3 = create_s3_client()
+        bio = download_to_bytesio(_worker_s3, key, attempts=2)
+        if not bio:
+            return None, None, f"download_failed:{key}"
+        img = safe_load_pil_from_bytes(bio)
+        if img is None:
+            bio.close()
+            return None, None, f"pil_open_failed:{key}"
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img = resize_image_in_memory(img, IMAGE_MAX_DIM)
+        arr = np.asarray(img)
+        encs = face_recognition.face_encodings(arr)
+        try:
+            img.close()
+        except Exception:
+            pass
+        bio.close()
         if not encs:
-            return None
-        return np.asarray(encs[0], dtype=np.float32)
+            return None, None, f"no_face_found:{key}"
+        return key, np.asarray(encs[0], dtype=np.float32), None
     except Exception as e:
-        logger.exception(f"Face encoding error: {e}")
-        return None
+        tb = traceback.format_exc()
+        logger.exception("worker_process_image exception for %s: %s\n%s", key, e, tb)
+        return None, None, f"worker_exception:{str(e)}"
 
-def process_image(key: str) -> Tuple[Optional[str], Optional[np.ndarray]]:
-    """
-    Download image from S3 key, validate/resize, compute face embedding.
-    Always returns a tuple (key or None, embedding or None).
-    This function is safe to call in a separate process (ProcessPoolExecutor).
-    """
-    proc = psutil.Process(os.getpid())
-    mem_before = proc.memory_info().rss / 1024 / 1024
-    logger.debug(f"[{key}] Starting process_image; memory_before={mem_before:.2f} MB")
-    bio = None
-    pil_img = None
+# synchronous fallback (main process)
+def sync_process_image(key: str) -> Tuple[Optional[str], Optional[np.ndarray], Optional[str]]:
     try:
-        bio = download_to_bytes(key)
-        if bio is None:
-            logger.warning(f"[{key}] Download failed or object missing")
-            return None, None
-
-        # Load via PIL to inspect size without fully converting to numpy
-        pil_img = _safe_load_pil(bio)
-        if pil_img is None:
-            logger.info(f"[{key}] PIL failed to open image, skipping")
-            return None, None
-
-        width, height = pil_img.size
-        pixels = width * height
-        # Reject extremely large images early
-        if pixels > MAX_PIXELS:
-            logger.warning(f"[{key}] Image too large ({width}x{height} = {pixels} px); rejecting")
-            return None, None
-
-        # Convert to RGB if necessary
-        if pil_img.mode not in ('RGB', 'L'):
-            pil_img = pil_img.convert('RGB')
-
-        # Resize to thumbnail for faster face detection; use LANCZOS for quality
-        pil_img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
-
-        # compute embedding
-        emb = compute_embedding_from_image(pil_img)
-        if emb is None:
-            logger.info(f"[{key}] No face found or encoding failed after resize")
-            return None, None
-
-        mem_after = proc.memory_info().rss / 1024 / 1024
-        logger.debug(f"[{key}] Completed embedding; memory_after={mem_after:.2f} MB")
-        return key, emb
-
+        bio = download_to_bytesio(s3, key, attempts=2)
+        if not bio:
+            return None, None, f"download_failed:{key}"
+        img = safe_load_pil_from_bytes(bio)
+        if img is None:
+            bio.close()
+            return None, None, f"pil_open_failed:{key}"
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img = resize_image_in_memory(img, IMAGE_MAX_DIM)
+        arr = np.asarray(img)
+        encs = face_recognition.face_encodings(arr)
+        try:
+            img.close()
+        except Exception:
+            pass
+        bio.close()
+        if not encs:
+            return None, None, f"no_face_found:{key}"
+        return key, np.asarray(encs[0], dtype=np.float32), None
     except Exception as e:
-        logger.exception(f"[{key}] Unexpected error processing image: {e}")
-        return None, None
-    finally:
-        # Ensure resources are closed and references dropped
-        try:
-            if pil_img:
-                pil_img.close()
-        except Exception:
-            pass
-        try:
-            if bio:
-                bio.close()
-        except Exception:
-            pass
+        tb = traceback.format_exc()
+        logger.exception("sync_process_image exception for %s: %s\n%s", key, e, tb)
+        return None, None, f"sync_exception:{str(e)}"
 
-def ingest_shoot(shoot_id: str, upload_embeddings_key: Optional[str] = None) -> dict:
-    """
-    Ingest a single shoot: list image keys, compute embeddings in parallel (processes),
-    and upload embeddings.npz back to S3.
-    Returns a result dict similar to your original format.
-    """
-    process = psutil.Process(os.getpid())
-    logger.info(f"Starting ingest for {shoot_id}, initial memory usage: {process.memory_info().rss / 1024 / 1024:.2f} MB")
+# ingest a single shoot
+def ingest_shoot(shoot_id: str, upload_key: Optional[str] = None) -> dict:
+    proc = psutil.Process(os.getpid())
+    logger.info("Starting ingest for %s; mem=%.2f MB", shoot_id, proc.memory_info().rss / 1024 / 1024)
     keys = list_shoot_keys(shoot_id)
-    logger.info(f"Processing {len(keys)} images for shoot {shoot_id}")
     if not keys:
-        logger.warning(f"No images found for shoot {shoot_id}")
+        logger.warning("No images found for shoot %s", shoot_id)
         return {"success": True, "message": "No images found", "count": 0}
-
-    # Determine worker count conservatively to avoid memory explosion
-    cpu_count = multiprocessing.cpu_count() or 1
-    # For process-based workers, be conservative: each process loads native libs and uses memory.
-    max_workers = min(MAX_WORKERS_CAP, max(1, cpu_count // 2))
-    logger.info(f"Using ProcessPoolExecutor with max_workers={max_workers}")
 
     embeddings: List[np.ndarray] = []
     kept_keys: List[str] = []
+    chunk_size = max(1, MAX_WORKERS * CHUNK_MULTIPLIER)
+    chunks = [keys[i:i+chunk_size] for i in range(0, len(keys), chunk_size)]
 
-    # Use ProcessPoolExecutor to isolate native extensions per-process (safer for heap integrity)
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        future_to_key = {executor.submit(process_image, key): key for key in keys}
-        for future in as_completed(future_to_key):
-            src_key = future_to_key[future]
-            try:
-                # Give processes more time than threads; if a process hangs, it will be reaped later.
-                key, emb = future.result(timeout=600)
-            except Exception as e:
-                logger.exception(f"Worker failed processing {src_key}: {e}")
-                continue
-            if emb is not None and key:
-                embeddings.append(emb)
-                kept_keys.append(key)
-            else:
-                logger.info(f"Skipping {src_key} due to no face or processing error")
+    for ci, chunk in enumerate(chunks, start=1):
+        logger.info("Processing chunk %d/%d size=%d", ci, len(chunks), len(chunk))
+        try:
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=_worker_init) as exe:
+                futures = {exe.submit(worker_process_image, k): k for k in chunk}
+                for fut in as_completed(futures):
+                    src_key = futures[fut]
+                    try:
+                        key, emb, err = fut.result(timeout=FUTURE_TIMEOUT)
+                    except TimeoutError:
+                        logger.warning("Future timeout for %s; trying sync fallback", src_key)
+                        key, emb, err = sync_process_image(src_key)
+                    except Exception as e:
+                        logger.exception("Future exception for %s: %s", src_key, e)
+                        key, emb, err = sync_process_image(src_key)
+                    if emb is not None and key:
+                        embeddings.append(emb)
+                        kept_keys.append(key)
+                        logger.info("Embedding found for %s", src_key)
+                    else:
+                        logger.info("No embedding for %s (%s)", src_key, err)
+        except Exception as e:
+            logger.exception("ProcessPool failed for chunk starting %s: %s; falling back to sync for chunk", chunk[0] if chunk else "N/A", e)
+            for k in chunk:
+                key, emb, err = sync_process_image(k)
+                if emb is not None and key:
+                    embeddings.append(emb)
+                    kept_keys.append(key)
+                    logger.info("Sync embedding found for %s", k)
+                else:
+                    logger.info("Sync no embedding for %s (%s)", k, err)
+
+        mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+        logger.info("After chunk %d mem=%.2f MB embeddings=%d", ci, mem, len(embeddings))
 
     if not embeddings:
-        logger.warning(f"No embeddings computed for shoot {shoot_id}")
+        logger.warning("No embeddings for shoot %s", shoot_id)
         return {"success": True, "message": "No embeddings found", "count": 0}
 
     try:
-        embs = np.stack(embeddings, axis=0)
+        embs = np.stack(embeddings, axis=0).astype(np.float32)
         keys_arr = np.array(kept_keys, dtype=object)
     except Exception as e:
-        logger.exception(f"Failed to stack embeddings for shoot {shoot_id}: {e}")
+        logger.exception("Failed to stack embeddings: %s", e)
         return {"success": False, "message": "Failed to assemble embeddings", "count": 0}
 
-    # Write compressed npz to a temporary file, ensure close before upload
     tmp_file = None
     try:
-        tmp = tempfile.NamedTemporaryFile(suffix=".npz", delete=False)
-        tmp_file = tmp.name
-        tmp.close()  # close so numpy can open it on Windows-like platforms
+        tmpf = tempfile.NamedTemporaryFile(suffix=".npz", delete=False)
+        tmp_file = tmpf.name
+        tmpf.close()
         np.savez_compressed(tmp_file, keys=keys_arr, embeddings=embs)
-        upload_key = upload_embeddings_key or f"projects/gallery/{shoot_id}/embeddings.npz"
-
-        # Upload with retry loop
-        attempt = 0
-        while attempt <= S3_UPLOAD_RETRIES:
-            attempt += 1
-            try:
-                s3.upload_file(Filename=tmp_file, Bucket=BUCKET, Key=upload_key)
-                logger.info(f"Uploaded embeddings to {upload_key}")
-                return {"success": True, "upload_key": upload_key, "count": len(kept_keys)}
-            except ClientError as e:
-                logger.exception(f"S3 upload_client_error for {upload_key} (attempt {attempt}): {e}")
-            except Exception as e:
-                logger.exception(f"Unexpected S3 upload error for {upload_key} (attempt {attempt}): {e}")
-            time.sleep(1 * attempt)
-
-        return {"success": False, "message": f"S3 upload failed after {S3_UPLOAD_RETRIES} retries", "count": 0}
+        upload_key = upload_key or f"projects/gallery/{shoot_id}/embeddings.npz"
+        s3.upload_file(Filename=tmp_file, Bucket=BUCKET, Key=upload_key)
+        logger.info("Uploaded embeddings for %s -> %s (count=%d)", shoot_id, upload_key, len(kept_keys))
+        return {"success": True, "upload_key": upload_key, "count": len(kept_keys)}
+    except Exception as e:
+        logger.exception("Failed uploading embeddings for %s: %s", shoot_id, e)
+        return {"success": False, "message": str(e), "count": 0}
     finally:
-        # cleanup temporary file
-        try:
-            if tmp_file and os.path.exists(tmp_file):
+        if tmp_file and os.path.exists(tmp_file):
+            try:
                 os.remove(tmp_file)
-        except Exception:
-            pass
+            except Exception:
+                pass
         mem_final = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-        logger.info(f"Finished ingest for {shoot_id}. Final memory usage: {mem_final:.2f} MB")
+        logger.info("Finished ingest for %s mem=%.2f MB", shoot_id, mem_final)
 
+# ingest all shoots
 def ingest_all_shoots() -> dict:
     shoots = list_shoots()
     if not shoots:
-        logger.warning("No shoots found in S3 bucket")
+        logger.warning("No shoots found")
         return {"success": True, "message": "No shoots found", "processed": 0}
-    
     results = []
-    for shoot_id in shoots:
-        logger.info(f"Processing shoot {shoot_id}")
+    for sid in shoots:
+        logger.info("Ingesting shoot %s", sid)
         try:
-            result = ingest_shoot(shoot_id)
+            r = ingest_shoot(sid)
         except Exception as e:
-            logger.exception(f"Top-level error ingesting shoot {shoot_id}: {e}")
-            result = {"success": False, "message": str(e), "count": 0}
-        results.append(result)
-    
+            logger.exception("Top-level ingest error for %s: %s", sid, e)
+            r = {"success": False, "message": str(e), "count": 0}
+        results.append(r)
     success_count = sum(1 for r in results if r.get("success"))
-    logger.info(f"Processed {len(shoots)} shoots, {success_count} successful")
-    return {
-        "success": True,
-        "message": f"Processed {len(shoots)} shoots",
-        "results": results,
-        "processed": len(shoots)
-    }
+    logger.info("Processed %d shoots, %d successful", len(shoots), success_count)
+    return {"success": True, "message": f"Processed {len(shoots)} shoots", "results": results, "processed": len(shoots)}
+
+# ---------------- Scheduler / watchdog ----------------
+_shutdown = False
+def _signal_handler(signum, frame):
+    global _shutdown
+    logger.info("Received signal %s, shutting down gracefully...", signum)
+    _shutdown = True
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+def run_scheduler_loop(interval_seconds: int = INGEST_INTERVAL_SECONDS, backoff_base: int = INGEST_BACKOFF_BASE):
+    """
+    Run continuous ingest_all_shoots() every `interval_seconds`.
+    On failure, apply exponential backoff using backoff_base.
+    This loop never exits unless SIGINT/SIGTERM received.
+    """
+    logger.info("Starting scheduler loop: interval=%ds backoff_base=%ds", interval_seconds, backoff_base)
+    consecutive_failures = 0
+    while not _shutdown:
+        start = time.time()
+        try:
+            res = ingest_all_shoots()
+            # success -> reset failure counter
+            consecutive_failures = 0
+            logger.info("Scheduler run completed: %s", res.get("message", "done"))
+        except Exception as e:
+            consecutive_failures += 1
+            logger.exception("Scheduler ingestion failed (attempt #%d): %s", consecutive_failures, e)
+            # backoff
+            wait = backoff_base * (2 ** (consecutive_failures - 1))
+            wait = min(wait, 3600)  # cap to 1 hour
+            logger.info("Backing off for %ds before retrying...", wait)
+            # sleep with shutdown checks
+            slept = 0
+            while slept < wait and not _shutdown:
+                time.sleep(1)
+                slept += 1
+        # normal interval wait
+        if _shutdown:
+            break
+        elapsed = time.time() - start
+        to_wait = max(0, interval_seconds - int(elapsed))
+        logger.info("Next scheduled run in %ds", to_wait)
+        slept = 0
+        while slept < to_wait and not _shutdown:
+            time.sleep(1)
+            slept += 1
+    logger.info("Scheduler loop exiting gracefully")
+
+# --------------- CLI Entrypoint ---------------
+def main():
+    parser = argparse.ArgumentParser(description="Ingest shoots and optionally run as scheduler/watchdog")
+    parser.add_argument("--shoot-id", help="Process single shoot id")
+    parser.add_argument("--ingest-all", action="store_true", help="Process all shoots once")
+    parser.add_argument("--daemon", action="store_true", help="Run continuous scheduler loop (same as INGEST_DAEMON env)")
+    args = parser.parse_args()
+
+    # Priority: explicit flags -> env var -> default behavior (daemon)
+    if args.shoot_id:
+        out = ingest_shoot(args.shoot_id)
+        print(out)
+        return 0
+    if args.ingest_all:
+        out = ingest_all_shoots()
+        print(out)
+        return 0
+    if args.daemon or INGEST_DAEMON:
+        run_scheduler_loop()
+        return 0
+
+    # Default behavior when no args passed: run scheduler loop (so container keeps running)
+    logger.info("No CLI arguments passed. Starting scheduler loop by default (to keep container running).")
+    run_scheduler_loop()
+    return 0
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1:
-        res = ingest_shoot(sys.argv[1])
-        print(res)
-        sys.exit(0)
-    else:
-        res = ingest_all_shoots()
-        print(res)
-        sys.exit(0)
+    try:
+        exit_code = main()
+    except Exception as e:
+        logger.exception("Unhandled exception in main: %s", e)
+        exit_code = 1
+    sys.exit(exit_code)

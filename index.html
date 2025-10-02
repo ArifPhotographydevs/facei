@@ -819,6 +819,8 @@
       lastResponse = resp;
       matchedImages.innerHTML = '';
 
+      console.info('Server returned matches (first 20):', (resp.matches || []).slice(0,20).map(m => ({ key: m.key, presigned: m.presigned_url })));
+
       // Enhanced header
       resultsTitle.textContent = `Found ${resp.matched_count} matching photo${resp.matched_count !== 1 ? 's' : ''}`;
       resultsMessage.textContent = resp.message || 'Your matched photos are ready for download!';
@@ -846,15 +848,28 @@
         const imgWrap = document.createElement('div');
         imgWrap.className = 'w-full overflow-hidden rounded-xl bg-gray-100 relative group';
         
+        // robust image element
         const img = document.createElement('img');
         img.className = 'matched-image w-full h-56 object-cover transition-transform duration-300 group-hover:scale-105';
-        img.src = m.presigned_url || '';
         img.alt = humanFilename(m.key || '');
         img.loading = 'lazy';
-        
-        // Add loading placeholder
+        img.crossOrigin = 'anonymous'; // helps cross-origin fetch if allowed
+
+        // Choose src: presigned_url preferred; if missing, set blank and rely on server to return correct URL
+        const src = m.presigned_url || '';
+        img.src = src;
+
+        // Add loading placeholder animation
         img.addEventListener('load', () => {
           img.classList.add('animate-fade-in');
+        });
+
+        // On error: replace with inline placeholder and log details for debugging
+        img.addEventListener('error', (ev) => {
+          console.error('Thumbnail failed to load', { key: m.key, presigned_url: m.presigned_url, imgSrc: img.src, event: ev });
+          img.src = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+            `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="240" viewBox="0 0 400 240"><rect width="100%" height="100%" fill="#e6eef7"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#94a3b8" font-size="16">Preview not available</text></svg>`
+          );
         });
 
         imgWrap.appendChild(img);
@@ -1037,14 +1052,23 @@
           showProgress(80);
           setTopStatus('Pending...');
           
+          // Build payload with limit and make_zip option
+          const payload = {
+            name,
+            email,
+            phone,
+            shoot_id: shoot,
+            selfie: base64,
+            // tune this to request more matches; server-side limits apply
+            limit: 200,
+            make_zip: false,
+            // optional: tolerance: 0.55
+          };
+
           const res = await fetch('/match', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name, email, phone,
-              shoot_id: shoot,
-              selfie: base64
-            })
+            body: JSON.stringify(payload)
           });
 
           showProgress(90);

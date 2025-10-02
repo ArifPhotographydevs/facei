@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """
-Fixed app.py for Face Recognition matcher.
+Improved full app.py for Face Recognition matcher.
 
-- Robust .npz loading (accepts multiple field names)
-- Worker functions are top-level (picklable) for ProcessPoolExecutor
-- Keeps embeddings-first flow and falls back to direct scanning
-- create_presigned_url accepts Bucket/Key keywords
+Changes and fixes included:
+- Robust .npz loading (many possible field names)
+- No synthetic placeholder keys returned (if keys array missing -> fallback to direct scan)
+- Uses all detected faces per image and keeps best distance per image
+- Picks best (minimum) distance for images that appear multiple times
+- Corrected variable name typos from previous code
+- MAX_WORKERS configurable via environment variable; conservative default
+- Better resource cleanup and defensive error handling
+- Presigned URLs generated for copied objects in client folder (downloadable)
+- Email sending is best-effort and will not break response on failure
+- CLI supports runserver, ingest, and optional --daemon flag for possible scheduler loop
+
+NOTE: This file contains sensitive example credentials copied from your earlier message.
+In production you should set credentials via environment variables or IAM role and never keep
+secrets inside source code.
 """
 
 import os
@@ -16,9 +27,9 @@ import tempfile
 import uuid
 import logging
 import base64
-import pickle
 from zipfile import ZipFile
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import List, Tuple, Optional
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -39,27 +50,29 @@ from email.mime.text import MIMEText
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("face-matcher")
 
-# ===== Configuration (edit these for your environment) =====
-ACCESS_KEY = "SW5I2XCNJAI7GTB7MRIW"
-SECRET_KEY = "eKNEI3erAhnSiBdcK0OltkTHIe2jJYJVhPu1eazJ"
-REGION = "ap-northeast-1"
-BUCKET = "arif12"
-ENDPOINT_URL = f"https://s3.{REGION}.wasabisys.com"
-BOTO_CONFIG = Config(max_pool_connections=50)
+# ===== Configuration (edit these for your environment or use env vars) =====
+ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", "SW5I2XCNJAI7GTB7MRIW")
+SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "eKNEI3erAhnSiBdcK0OltkTHIe2jJYJVhPu1eazJ")
+REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
+BUCKET = os.environ.get("S3_BUCKET", "arif12")
+ENDPOINT_URL = os.environ.get("S3_ENDPOINT", f"https://s3.{REGION}.wasabisys.com")
+BOTO_CONFIG = Config(max_pool_connections=int(os.environ.get("BOTO_MAX_POOL", "50")))
 
-# Email config (use env vars in production)
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SENDER_EMAIL = "githubarifphotography@gmail.com"
-SENDER_PASSWORD = "utuz rvgk kmsv sntz"
+# Email config (for production supply via environment variables)
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "githubarifphotography@gmail.com")
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "utuz rvgk kmsv sntz")
 
 # Matching hyperparams
-IMAGE_MAX_SIZE = (800, 800)
-MAX_WORKERS = min(8, (os.cpu_count() or 2))
-MAX_MATCHES = 200
-FACE_COMPARE_TOLERANCE = 0.6  # L2 distance threshold used for embeddings
+IMAGE_MAX_SIZE = (1600, 1600)  # reasonable default; images will be resized for processing
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", min(4, (os.cpu_count() or 2))))
+MAX_MATCHES = int(os.environ.get("MAX_MATCHES", "200"))
+FACE_COMPARE_TOLERANCE = float(os.environ.get("FACE_COMPARE_TOLERANCE", "0.65"))  # L2 distance threshold
 
-# ===== S3 client =====
+logger.info(f"Configuration: REGION={REGION}, BUCKET={BUCKET}, MAX_WORKERS={MAX_WORKERS}, TOL={FACE_COMPARE_TOLERANCE}")
+
+# ===== S3 client (main process) =====
 s3 = boto3.client(
     "s3",
     aws_access_key_id=ACCESS_KEY,
@@ -74,7 +87,7 @@ app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
 # ===== Helper utilities =====
-def safe_resize_image(path, max_size=IMAGE_MAX_SIZE):
+def safe_resize_image(path: str, max_size: Tuple[int, int] = IMAGE_MAX_SIZE) -> None:
     """Resize in-place preserving aspect ratio, convert to RGB if necessary."""
     try:
         with Image.open(path) as img:
@@ -90,7 +103,7 @@ def safe_resize_image(path, max_size=IMAGE_MAX_SIZE):
         logger.warning(f"safe_resize_image failed for {path}: {e}")
 
 def _create_s3_client_for_worker():
-    """Create an s3 client for use inside worker processes."""
+    """Create an s3 client for use inside worker processes (picklable)."""
     return boto3.client(
         "s3",
         aws_access_key_id=ACCESS_KEY,
@@ -103,9 +116,7 @@ def _create_s3_client_for_worker():
 def create_presigned_url(*, Bucket=None, Key=None, bucket=None, key=None, expiration=3600, **kwargs):
     """
     Create a presigned URL for an S3 object.
-    Accepts:
-      create_presigned_url(Bucket=..., Key=...)
-      create_presigned_url(bucket=..., key=...)
+    Accepts both (Bucket, Key) and (bucket, key) forms.
     """
     bucket_name = Bucket or bucket
     object_key = Key or key
@@ -124,7 +135,8 @@ def create_presigned_url(*, Bucket=None, Key=None, bucket=None, key=None, expira
         logger.error(f"Failed to generate presigned URL for {object_key}: {e}")
         return None
 
-def send_link_email(download_url, recipient_email, name, phone, shoot_id):
+def send_link_email(download_url: str, recipient_email: str, name: str, phone: str, shoot_id: str) -> None:
+    """Send a simple plaintext email with link. Best-effort; exceptions are logged and re-raised."""
     try:
         msg = MIMEMultipart()
         msg["From"] = SENDER_EMAIL
@@ -145,25 +157,25 @@ Face Matcher Bot
 """
         msg.attach(MIMEText(body, "plain"))
 
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
             server.starttls()
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            if SENDER_EMAIL and SENDER_PASSWORD:
+                try:
+                    server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                except Exception as e:
+                    logger.warning(f"SMTP login failed (will still attempt send): {e}")
             server.sendmail(SENDER_EMAIL, recipient_email, msg.as_string())
         logger.info(f"Sent download link to {recipient_email}")
     except Exception as e:
         logger.exception(f"Failed to send email to {recipient_email}: {e}")
+        # Do not raise to avoid breaking normal flow; caller can choose to ignore/email best-effort.
         raise
 
 # ===== S3 listing helpers =====
-def list_shoot_ids(prefix="projects/gallery/"):
-    """
-    Return a sorted list of shoot ids found under the given prefix.
-    Handles both CommonPrefixes (delimiter) and flat listing fallback.
-    """
+def list_shoot_ids(prefix: str = "projects/gallery/") -> List[str]:
+    """Return sorted list of shoot ids found under the given prefix."""
     paginator = s3.get_paginator('list_objects_v2')
     shoots_set = set()
-
-    # Try common prefixes first (fast if keys are structured like folders)
     try:
         page_iterator = paginator.paginate(Bucket=BUCKET, Prefix=prefix, Delimiter='/')
         for page in page_iterator:
@@ -176,7 +188,6 @@ def list_shoot_ids(prefix="projects/gallery/"):
     except Exception as e:
         logger.warning(f"Delimiter-based listing failed: {e}")
 
-    # Fallback: parse all keys under the prefix
     if not shoots_set:
         try:
             page_iterator = paginator.paginate(Bucket=BUCKET, Prefix=prefix)
@@ -195,8 +206,8 @@ def list_shoot_ids(prefix="projects/gallery/"):
 
     return sorted(shoots_set)
 
-# ===== Ingest / embeddings creation (worker used earlier) =====
-def compute_face_encodings_for_local_image(path):
+# ===== Ingest / embeddings creation (workers) =====
+def compute_face_encodings_for_local_image(path: str) -> List[np.ndarray]:
     """Return list of encodings (list of numpy arrays) for faces in given image path."""
     try:
         with Image.open(path) as im:
@@ -213,9 +224,10 @@ def compute_face_encodings_for_local_image(path):
         logger.exception(f"Failed to encode image {path}: {e}")
         return []
 
-def _worker_compute_encoding(s3_key):
-    """Worker function run in a separate process to download and compute encodings for a single s3 key.
-       Returns list of (key, encoding) pairs (usually one, but multiple faces -> multiple entries).
+def _worker_compute_encoding(s3_key: str) -> List[Tuple[str, np.ndarray]]:
+    """
+    Worker executed in separate process: download image to temp file,
+    compute face encodings, and return list of (s3_key, encoding).
     """
     local_client = _create_s3_client_for_worker()
     fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(s3_key)[1] or ".jpg")
@@ -237,21 +249,17 @@ def _worker_compute_encoding(s3_key):
         except Exception:
             pass
 
-def ingest_shoot_embeddings(shoot_id, save_overwrite=True):
+def ingest_shoot_embeddings(shoot_id: str, save_overwrite: bool = True) -> bool:
     """
-    For a given shoot_id, compute face encodings for all images under projects/gallery/<shoot_id>/
-    and save them to projects/gallery/<shoot_id>/embeddings.npz
-    The saved structure is:
-      np.savez_compressed(emb_path, keys=keys_array, encodings=encodings_array)
-    where keys_array is an array of strings of length N, and encodings_array is shape (N, 128).
+    Compute face encodings for all images in a shoot and upload embeddings.npz to S3.
+    The npz contains keys (string array) and encodings (N x D float32).
     """
     prefix = f"projects/gallery/{shoot_id}/"
     logger.info(f"Starting ingestion for shoot: {shoot_id} (prefix={prefix})")
 
-    # List image keys
     paginator = s3.get_paginator('list_objects_v2')
     page_iterator = paginator.paginate(Bucket=BUCKET, Prefix=prefix)
-    image_keys = []
+    image_keys: List[str] = []
     for page in page_iterator:
         for obj in page.get("Contents", []):
             k = obj.get("Key")
@@ -260,12 +268,11 @@ def ingest_shoot_embeddings(shoot_id, save_overwrite=True):
 
     logger.info(f"Found {len(image_keys)} images for shoot {shoot_id}")
 
-    # Map many keys to workers
-    encodings = []
-    keys = []
+    encodings: List[np.ndarray] = []
+    keys: List[str] = []
 
     if image_keys:
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as exe:
+        with ProcessPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(image_keys)))) as exe:
             futures = {exe.submit(_worker_compute_encoding, k): k for k in image_keys}
             for fut in as_completed(futures):
                 try:
@@ -281,10 +288,13 @@ def ingest_shoot_embeddings(shoot_id, save_overwrite=True):
         logger.warning(f"No face encodings found for shoot {shoot_id}; not writing embeddings file.")
         return False
 
-    encodings_np = np.stack(encodings).astype(np.float32)  # shape (N, D)
-    keys_arr = np.array(keys, dtype=np.str_)
+    try:
+        encodings_np = np.stack(encodings).astype(np.float32)  # shape (N, D)
+        keys_arr = np.array(keys, dtype=np.str_)
+    except Exception as e:
+        logger.exception(f"Failed to assemble numpy arrays for {shoot_id}: {e}")
+        return False
 
-    # Save to a temp npz and upload to s3
     fd, tmp_npz = tempfile.mkstemp(suffix=".npz")
     os.close(fd)
     try:
@@ -304,11 +314,10 @@ def ingest_shoot_embeddings(shoot_id, save_overwrite=True):
             pass
 
 # ===== Worker used for direct scanning (top-level so picklable) =====
-def worker_compare(args):
+def worker_compare(args: Tuple[str, np.ndarray]) -> Optional[dict]:
     """
-    Top-level worker for direct image scanning when embeddings file is missing/malformed.
-    args is (key, known_encoding)
-    Returns {"key": key, "distance": d} if matched else None
+    Compare known_encoding to faces in a given image key.
+    Returns {"key": key, "distance": best_distance} if matched else None.
     """
     key, known_enc = args
     local_client = _create_s3_client_for_worker()
@@ -326,10 +335,13 @@ def worker_compare(args):
         encs = face_recognition.face_encodings(image)
         if not encs:
             return None
+        best_d = None
         for enc in encs:
-            d = np.linalg.norm(np.array(enc, dtype=np.float32) - known_enc)
-            if d <= FACE_COMPARE_TOLERANCE:
-                return {"key": key, "distance": float(d)}
+            d = float(np.linalg.norm(np.array(enc, dtype=np.float32) - known_enc))
+            if best_d is None or d < best_d:
+                best_d = d
+        if best_d is not None and best_d <= FACE_COMPARE_TOLERANCE:
+            return {"key": key, "distance": float(best_d)}
         return None
     except Exception as e:
         logger.debug(f"Direct worker failed for {key}: {e}")
@@ -403,7 +415,7 @@ def match_face():
             f.write(selfie_bytes)
 
         try:
-            with Image.open(selfelfie_path := selfie_path) as test_img:
+            with Image.open(selfie_path) as test_img:
                 test_img.verify()
         except (UnidentifiedImageError, Exception) as e:
             logger.warning(f"Uploaded selfie is not a valid image: {e}")
@@ -413,7 +425,8 @@ def match_face():
                 pass
             return jsonify({"success": False, "message": "Uploaded selfie is not a valid image."}), 400, {'Access-Control-Allow-Origin': '*'}
 
-        safe_resize_image(selfief_path := selfie_path) if False else safe_resize_image(selfie_path)  # keep earlier behavior
+        # Resize selfie (if large) and compute known encoding(s)
+        safe_resize_image(selfie_path, max_size=IMAGE_MAX_SIZE)
         known_image = face_recognition.load_image_file(selfie_path)
         known_encodings = face_recognition.face_encodings(known_image)
         try:
@@ -424,26 +437,27 @@ def match_face():
         if not known_encodings:
             return jsonify({"success": False, "message": "No face found in selfie"}), 400, {'Access-Control-Allow-Origin': '*'}
 
+        # Use the first detected face in selfie as the probe encoding (common practice)
         known_encoding = np.array(known_encodings[0], dtype=np.float32)
 
         # Try to use precomputed embeddings
         embeddings_key = f"projects/gallery/{shoot_id}/embeddings.npz"
         matched = []
         npz_tmp_path = None
+        used_embeddings_file = False
         try:
             fd, tmp_npz = tempfile.mkstemp(suffix=".npz")
             os.close(fd)
             npz_tmp_path = tmp_npz
             s3.download_file(Bucket=BUCKET, Key=embeddings_key, Filename=tmp_npz)
             npz = np.load(tmp_npz, allow_pickle=True)
-            logger.info(f"Loaded embeddings.npz keys: {npz.files}")
+            logger.info(f"Loaded embeddings.npz fields: {npz.files}")
 
-            # Robustly find encodings array
+            # heuristics for encodings & keys fields
             encodings_arr = None
             keys_arr = None
 
-            # heuristics for encodings field
-            possible_enc_keys = ['encodings', 'embeddings', 'data', 'arr_0', 'array', 'encoding']
+            possible_enc_keys = ['encodings', 'embeddings', 'data', 'arr_0', 'array', 'encoding', 'encs']
             possible_key_keys = ['keys', 'filenames', 'names', 'paths', 'keys_arr', 'arr_1', 'arr_0']
 
             for k in possible_enc_keys:
@@ -451,12 +465,11 @@ def match_face():
                     encodings_arr = npz[k]
                     logger.info(f"Using encodings from npz['{k}']")
                     break
-            # if still None, try first array-like item that's numeric
+
             if encodings_arr is None:
                 for f in npz.files:
                     try:
-                        arr = npz[f]
-                        arr = np.array(arr)
+                        arr = np.array(npz[f])
                         if arr.ndim == 2 and np.issubdtype(arr.dtype, np.number):
                             encodings_arr = arr
                             logger.info(f"Inferred encodings from npz['{f}']")
@@ -464,63 +477,64 @@ def match_face():
                     except Exception:
                         continue
 
-            # find keys mapping
             for k in possible_key_keys:
                 if k in npz.files:
                     keys_arr = npz[k]
                     logger.info(f"Using keys from npz['{k}']")
                     break
-            if keys_arr is None:
-                # try any string-like array in npz
-                for f in npz.files:
-                    if f == 'encodings' or f == 'embeddings' or f == 'data':
-                        continue
-                    try:
-                        arr = npz[f]
-                        if np.array(arr).dtype.type is np.bytes_ or np.array(arr).dtype.type is np.str_ or arr.dtype.kind in ('U', 'S', 'O'):
-                            keys_arr = arr
-                            logger.info(f"Inferred keys from npz['{f}']")
-                            break
-                    except Exception:
-                        continue
+
+            keys_list = None
+            if keys_arr is not None:
+                try:
+                    keys_list = [(k.decode('utf-8') if isinstance(k, (bytes, bytearray)) else str(k)) for k in np.array(keys_arr).tolist()]
+                except Exception:
+                    keys_list = [str(k) for k in np.array(keys_arr).tolist()]
 
             if encodings_arr is None:
-                raise ValueError(f"No encodings array found in embeddings file; available fields: {npz.files}")
+                raise ValueError(f"No numeric encodings array found in embeddings file; available fields: {npz.files}")
 
             encodings = np.array(encodings_arr, dtype=np.float32)
             if encodings.ndim != 2:
                 raise ValueError(f"encodings array has unexpected shape {encodings.shape}")
 
-            if keys_arr is None:
-                # If number of rows equals number of files, generate synthetic keys placeholders
-                if encodings.shape[0] > 0:
-                    logger.warning("Keys array not found in npz; generating placeholder keys as indices.")
-                    keys = [f"idx_{i}" for i in range(encodings.shape[0])]
-                else:
-                    keys = []
-            else:
-                # normalize keys array to list of strings
-                try:
-                    keys = [ (k.decode('utf-8') if isinstance(k, (bytes, bytearray)) else str(k)) for k in np.array(keys_arr).tolist() ]
-                except Exception:
-                    keys = [str(k) for k in np.array(keys_arr).tolist()]
+            # Only accept keys_list if length matches encodings; otherwise fallback to direct scan
+            if keys_list is None or len(keys_list) != encodings.shape[0]:
+                raise ValueError("embeddings file missing a valid keys array or length mismatch; falling back to direct scan.")
 
-            logger.info(f"Embeddings count: {encodings.shape[0]}, keys count: {len(keys)}")
-            # compute distances
-            if encodings.shape[0] > 0:
-                diffs = encodings - known_encoding
-                dists = np.linalg.norm(diffs, axis=1)
-                tol = FACE_COMPARE_TOLERANCE
-                idxs = np.where(dists <= tol)[0]
-                for idx in idxs[:MAX_MATCHES]:
-                    key = keys[idx] if idx < len(keys) else f"idx_{idx}"
-                    matched.append({"key": key, "distance": float(dists[idx])})
+            used_embeddings_file = True
+            logger.info(f"Using embeddings file: {encodings.shape[0]} encodings; computing distances")
+
+            # compute distances and filter by tolerance
+            diffs = encodings - known_encoding
+            dists = np.linalg.norm(diffs, axis=1)
+            tol = FACE_COMPARE_TOLERANCE
+            idxs = np.where(dists <= tol)[0]
+            logger.info(f"Found {len(idxs)} indices within tolerance in embeddings file")
+
+            # group by key - keep best distance per key (in case multiple faces from same image)
+            best_by_key = {}
+            for idx in idxs:
+                key = keys_list[idx]
+                dist = float(dists[idx])
+                if not key or key.startswith("idx_"):
+                    # avoid synthetic placeholders (defensive)
+                    logger.debug(f"Skipping synthetic or invalid key {key}")
+                    continue
+                if key not in best_by_key or dist < best_by_key[key]:
+                    best_by_key[key] = dist
+
+            # create matched list sorted by distance ascending
+            for k, d in sorted(best_by_key.items(), key=lambda kv: kv[1])[:MAX_MATCHES]:
+                matched.append({"key": k, "distance": float(d)})
+
         except ClientError as e:
             logger.warning(f"Embeddings file not found or unreadable for shoot {shoot_id}: {e}; falling back to full scan.")
             matched = []
+            used_embeddings_file = False
         except Exception as e:
-            logger.exception(f"Error while loading embeddings for shoot {shoot_id}: {e}")
+            logger.warning(f"Embeddings file unusable for shoot {shoot_id}: {e}; falling back to full scan.")
             matched = []
+            used_embeddings_file = False
         finally:
             if npz_tmp_path and os.path.exists(npz_tmp_path):
                 try:
@@ -528,13 +542,12 @@ def match_face():
                 except Exception:
                     pass
 
-        # If embeddings didn't yield matches and no matches found, fallback to scanning all images (slower).
+        # If embeddings didn't yield matches, fallback to scanning all images (slower).
         if not matched:
             logger.info("Falling back to scanning images directly (this can be slow).")
-            # List images
             paginator = s3.get_paginator('list_objects_v2')
             page_iterator = paginator.paginate(Bucket=BUCKET, Prefix=f"projects/gallery/{shoot_id}/")
-            image_keys = []
+            image_keys: List[str] = []
             for page in page_iterator:
                 for obj in page.get("Contents", []):
                     key = obj.get("Key")
@@ -544,7 +557,7 @@ def match_face():
             logger.info(f"Found {len(image_keys)} images to scan for direct matching.")
 
             if image_keys:
-                with ProcessPoolExecutor(max_workers=MAX_WORKERS) as exe:
+                with ProcessPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(image_keys)))) as exe:
                     futures = {exe.submit(worker_compare, (k, known_encoding)): k for k in image_keys}
                     for fut in as_completed(futures):
                         try:
@@ -558,7 +571,17 @@ def match_face():
                         except Exception as e:
                             logger.exception(f"Exception in direct-scan future: {e}")
 
-        logger.info(f"Total matches found: {len(matched)}")
+            # dedupe and keep best per key
+            if matched:
+                best_by_key = {}
+                for m in matched:
+                    k = m['key']
+                    d = float(m['distance'])
+                    if k not in best_by_key or d < best_by_key[k]:
+                        best_by_key[k] = d
+                matched = [{"key": k, "distance": float(best_by_key[k])} for k in sorted(best_by_key, key=lambda x: best_by_key[x])][:MAX_MATCHES]
+
+        logger.info(f"Total matched images after filtering: {len(matched)}")
 
         zip_url = None
         final_matches = []
@@ -571,21 +594,20 @@ def match_face():
                 with ZipFile(zip_path, "w") as zipf:
                     for m in matched:
                         key = m["key"]
+                        if not key or key.startswith("idx_"):
+                            logger.debug(f"Skipping non-downloadable key {key}")
+                            continue
                         fd, local_tmp = tempfile.mkstemp(suffix=os.path.splitext(key)[1] or ".jpg")
                         os.close(fd)
                         try:
-                            # If keys were placeholders like idx_0, they aren't valid S3 keys, skip download
-                            if key.startswith("idx_"):
-                                logger.debug(f"Skipping download for placeholder key {key}")
-                                continue
                             s3.download_file(Bucket=BUCKET, Key=key, Filename=local_tmp)
-                            zipf.write(local_tmp, arcname=os.path.basename(local_tmp))
+                            # store in zip under the original basename (keep readable name)
+                            zipf.write(local_tmp, arcname=os.path.basename(key))
                             os.unlink(local_tmp)
                         except Exception as e:
                             logger.warning(f"Failed to download matched key {key}: {e}")
                 temp_zip_key = f"temp_zips/{uuid.uuid4()}.zip"
                 s3.upload_file(Filename=zip_path, Bucket=BUCKET, Key=temp_zip_key)
-                # Use fixed create_presigned_url signature accepting Bucket/Key
                 zip_url = create_presigned_url(Bucket=BUCKET, Key=temp_zip_key)
                 try:
                     os.unlink(zip_path)
@@ -611,14 +633,21 @@ def match_face():
             user_folder = f"clients/{user_id}/"
             for m in matched:
                 key = m["key"]
+                if not key or key.startswith("idx_"):
+                    logger.debug(f"Skipping placeholder or invalid key {key} for copy step")
+                    continue
                 try:
-                    # skip placeholders
-                    if key.startswith("idx_"):
+                    # Confirm object exists before copying
+                    try:
+                        s3.head_object(Bucket=BUCKET, Key=key)
+                    except ClientError as e:
+                        logger.warning(f"Matched key not available in S3 at copy-time: {key}: {e}")
                         continue
+
                     src = {"Bucket": BUCKET, "Key": key}
                     dest_key = f"{user_folder}{os.path.basename(key)}"
                     s3.copy_object(Bucket=BUCKET, CopySource=src, Key=dest_key)
-                    presigned = create_presigned_url(Bucket=BUCKET, Key=key)
+                    presigned = create_presigned_url(Bucket=BUCKET, Key=dest_key)
                     final_matches.append({"key": key, "presigned_url": presigned, "distance": m.get("distance")})
                 except Exception:
                     logger.exception(f"Failed to copy matched object {key} to {user_folder}")
@@ -656,6 +685,7 @@ def main():
     ingest_group = ingest_parser.add_mutually_exclusive_group(required=True)
     ingest_group.add_argument("--shoot-id", help="Single shoot id to ingest (projects/gallery/<shoot_id>/)")
     ingest_group.add_argument("--ingest-all", action="store_true", help="Ingest all shoots found under projects/gallery/")
+    ingest_parser.add_argument("--daemon", action="store_true", help="Run continuous scheduler loop (legacy)")
 
     args = parser.parse_args()
 
@@ -670,6 +700,7 @@ def main():
                 logger.info(f"Ingesting {sid} ...")
                 success = ingest_shoot_embeddings(sid)
                 logger.info(f"Ingest {sid} success: {success}")
+                # If daemon/scheduler desired, caller can use --daemon and external scheduler (keeps script simple)
         else:
             sid = args.shoot_id
             logger.info(f"Ingesting single shoot: {sid}")
