@@ -57,7 +57,7 @@
 
     body {
       background: var(--gradient-bg);
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-family: 'Inter', -apple-system, BlinkMacSystemSystemFont, sans-serif;
     }
 
     .image-preview { 
@@ -584,26 +584,50 @@
       bar.style.width = '0%';
     }
 
+    // ---------- Robust toggleLoading ----------
     function toggleLoading(on) {
+      // always get fresh reference to the icon
+      const iconEl = document.getElementById('submitIcon');
       if (on) {
         submitBtn.disabled = true;
         submitBtn.classList.add('opacity-75', 'cursor-not-allowed');
-        submitIcon.outerHTML = `
-          <svg id="submitIcon" class="w-5 h-5 animate-spin" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="10" stroke="currentColor" class="opacity-25" stroke-width="4" fill="none"></circle>
-            <path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"></path>
-          </svg>
-        `;
+        if (iconEl) {
+          iconEl.outerHTML = `
+            <svg id="submitIcon" class="w-5 h-5 animate-spin" viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="10" stroke="currentColor" class="opacity-25" stroke-width="4" fill="none"></circle>
+              <path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"></path>
+            </svg>
+          `;
+        } else {
+          // safe fallback: insert spinner before text
+          submitBtn.insertAdjacentHTML('afterbegin', `
+            <svg id="submitIcon" class="w-5 h-5 animate-spin" viewBox="0 0 24 24" style="margin-right:0.5rem">
+              <circle cx="12" cy="12" r="10" stroke="currentColor" class="opacity-25" stroke-width="4" fill="none"></circle>
+              <path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"></path>
+            </svg>
+          `);
+        }
         submitText.textContent = 'Searching...';
         showProgress(20);
       } else {
         submitBtn.disabled = false;
         submitBtn.classList.remove('opacity-75', 'cursor-not-allowed');
-        submitIcon.outerHTML = `
-          <svg id="submitIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
-          </svg>
-        `;
+        const freshIcon = document.getElementById('submitIcon');
+        // If the icon was replaced earlier, ensure the search icon is (re)inserted
+        if (!freshIcon) {
+          submitBtn.insertAdjacentHTML('afterbegin', `
+            <svg id="submitIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="margin-right:0.5rem">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+            </svg>
+          `);
+        } else {
+          // replace with non-spinning icon (safe if element exists)
+          freshIcon.outerHTML = `
+            <svg id="submitIcon" class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+            </svg>
+          `;
+        }
         submitText.textContent = 'Find My Photos';
         hideProgress();
       }
@@ -1005,6 +1029,8 @@
         toast('Failed to read image file. Please try again.', 'error');
         setTopStatus('Ready to match');
       };
+
+      // ---------- Robust reader.onload with finally to always reset UI ----------
       reader.onload = async () => {
         try {
           const base64 = reader.result.split(',')[1];
@@ -1022,26 +1048,30 @@
           });
 
           showProgress(90);
-          const data = await res.json();
+          let data;
+          try {
+            data = await res.json();
+          } catch (e) {
+            data = { message: 'Invalid JSON response from server' };
+          }
           showProgress(100);
 
           if (!res.ok) {
-            toggleLoading(false); // Ensure loading stops on error
             setTopStatus('Search failed');
             toast(data.message || 'Server error occurred. Please try again.', 'error', 5000);
             lastResponse = data;
             jsonBox.textContent = JSON.stringify(data, null, 2);
-            hideProgress();
           } else {
-            toggleLoading(false); // Ensure loading stops on success
             toast('Data received successfully!', 'success', 2000);
             renderMatches(data);
           }
         } catch (err) {
-          toggleLoading(false); // Ensure loading stops on network error
           console.error(err);
           toast('Network error. Please check your connection and try again.', 'error', 5000);
           setTopStatus('Connection failed');
+        } finally {
+          // ALWAYS reset loading UI
+          toggleLoading(false);
           hideProgress();
         }
       };
