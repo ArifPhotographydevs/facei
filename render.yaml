@@ -1,0 +1,132 @@
+# render.yaml — Render Blueprint for FaceMatcher (Docker-based)
+# - Uses a managed Key Value (Redis) instance
+# - Web service (Docker)
+# - Background worker (Docker)
+# - Cron job to run ingest_shoot.py daily
+#
+# IMPORTANT:
+#  - Do NOT put secrets in this file. Use `sync: false` (prompt) or add secrets in Render Dashboard.
+#  - This file assumes it's placed at the repo root where your Dockerfile lives.
+#  - Adjust branch, names, memory/plan, schedules, and region to taste.
+
+services:
+
+  # 1) Managed Redis (Render Key Value instance)
+  - type: keyvalue
+    name: face-matcher-redis
+    ipAllowList: []           # empty list => only internal Render services can access it
+    region: oregon            # change to your preferred region (e.g., ap-northeast-1 if supported)
+    plan: starter             # change to free/pro based on needs
+    maxmemoryPolicy: allkeys-lru
+
+  # 2) Web service (Docker)
+  - type: web
+    runtime: docker
+    name: face-matcher-web
+    repo: ""                  # optional: omit to use repo containing this render.yaml
+    branch: main
+    dockerfilePath: Dockerfile
+    numInstances: 1
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      # Reference the Key Value (Redis) connection string
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: face-matcher-redis
+          property: connectionString
+
+      # Non-secret config values (safe to include)
+      - key: SHOOTS_ENDPOINT
+        value: /shoots
+      - key: MATCH_ENDPOINT
+        value: /match
+      - key: PORT
+        value: "5000"
+
+      # Secret credentials — prompt during Blueprint creation (do NOT commit secrets)
+      - key: ACCESS_KEY
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: BUCKET
+        sync: false
+      - key: REGION
+        sync: false
+      - key: ENDPOINT_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+
+    # optional scaling / resources block
+    scaling:
+      minInstances: 1
+      maxInstances: 2
+
+  # 3) Background worker (Docker) — runs RQ worker (face queue)
+  - type: worker
+    runtime: docker
+    name: face-matcher-worker
+    branch: main
+    dockerfilePath: Dockerfile
+    plan: starter
+    # Use startCommand to match your docker-compose `command: rq worker --url redis://... face`
+    startCommand: bash -lc "rq worker --url $REDIS_URL face"
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: face-matcher-redis
+          property: connectionString
+
+      # Same secret prompts for worker
+      - key: ACCESS_KEY
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: BUCKET
+        sync: false
+      - key: REGION
+        sync: false
+      - key: ENDPOINT_URL
+        sync: false
+      - key: SHOOT_EMB_CACHE_TTL
+        value: "600"
+
+    # Resource limits similar to the compose `deploy.resources.limits.memory`
+    scaling:
+      minInstances: 1
+      maxInstances: 1
+
+  # 4) Cron job to run ingest_shoot.py (adjust schedule)
+  - type: cron
+    runtime: docker
+    name: face-matcher-ingest
+    branch: main
+    dockerfilePath: Dockerfile
+    # Cron schedule (this runs daily at 02:00 UTC). Change to your desired cron pattern.
+    schedule: "0 2 * * *"
+    buildCommand: "true"     # keep as string if you don't need an extra build step
+    startCommand: python ingest_shoot.py
+    envVars:
+      - key: ACCESS_KEY
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: BUCKET
+        sync: false
+      - key: REGION
+        sync: false
+      - key: ENDPOINT_URL
+        sync: false
+
+# Optionally define envVarGroups (if you want to reuse groups)
+# envVarGroups:
+#   - name: common-storage
+#     envVars:
+#       - key: BUCKET
+#         sync: false
+#       - key: REGION
+#         sync: false
