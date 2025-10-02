@@ -1,0 +1,122 @@
+# render.yaml — Render Blueprint for facei (Docker-based)
+# Repo: https://github.com/ArifPhotographydevs/facei.git
+#
+# IMPORTANT:
+#  - Do NOT commit secret values into this file. Render will prompt for sync:false vars.
+#  - Adjust schedule, plan, region as needed.
+
+services:
+
+  # 1) Managed Redis (Key Value)
+  - type: keyvalue
+    name: face-matcher-redis
+    ipAllowList: []
+    plan: starter
+    maxmemoryPolicy: allkeys-lru
+
+  # 2) Web service (Docker)
+  - type: web
+    runtime: docker
+    name: face-matcher-web
+    repo: https://github.com/ArifPhotographydevs/facei.git
+    branch: main
+    dockerfilePath: Dockerfile
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+
+    scaling:
+      minInstances: 1
+      maxInstances: 2
+      targetCPUPercent: 50
+
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: face-matcher-redis
+          property: connectionString
+
+      - key: SHOOTS_ENDPOINT
+        value: /shoots
+      - key: MATCH_ENDPOINT
+        value: /match
+      - key: PORT
+        value: "5000"
+
+      - key: ACCESS_KEY
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: BUCKET
+        sync: false
+      - key: REGION
+        sync: false
+      - key: ENDPOINT_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+
+  # 3) Background worker (Docker) — runs RQ worker (face queue)
+  - type: worker
+    runtime: docker
+    name: face-matcher-worker
+    repo: https://github.com/ArifPhotographydevs/facei.git
+    branch: main
+    dockerfilePath: Dockerfile
+    plan: starter
+    autoDeploy: true
+
+    # use sh -lc as a single array item so env var interpolation works
+    command: ["sh", "-lc", "rq worker --url \"$REDIS_URL\" face"]
+
+    scaling:
+      minInstances: 1
+      maxInstances: 2
+      targetCPUPercent: 50
+
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: face-matcher-redis
+          property: connectionString
+
+      - key: SHOOT_EMB_CACHE_TTL
+        value: "600"
+
+      - key: ACCESS_KEY
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: BUCKET
+        sync: false
+      - key: REGION
+        sync: false
+      - key: ENDPOINT_URL
+        sync: false
+
+  # 4) Cron job to run ingest_shoot.py on a schedule
+  - type: cron
+    runtime: docker
+    name: face-matcher-ingest
+    repo: https://github.com/ArifPhotographydevs/facei.git
+    branch: main
+    dockerfilePath: Dockerfile
+    schedule: "0 2 * * *"   # daily at 02:00 UTC — change as needed
+    plan: starter
+
+    # simple array-form command for the cron job
+    command: ["python", "ingest_shoot.py"]
+
+    envVars:
+      - key: ACCESS_KEY
+        sync: false
+      - key: SECRET_KEY
+        sync: false
+      - key: BUCKET
+        sync: false
+      - key: REGION
+        sync: false
+      - key: ENDPOINT_URL
+        sync: false
