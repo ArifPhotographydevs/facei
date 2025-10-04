@@ -926,10 +926,6 @@
         actions.className = 'flex gap-3';
 
         const dl = document.createElement('a');
-        dl.href = m.presigned_url || '#';
-        dl.target = '_blank';
-        dl.rel = 'noopener noreferrer';
-        dl.download = humanFilename(m.key || '');
         dl.className = 'flex-1 button-enhanced bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-700 hover:to-cyan-700 text-white px-4 py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 shadow-lg';
         dl.setAttribute('aria-label', `Download ${humanFilename(m.key||'')}`);
         dl.innerHTML = `
@@ -938,6 +934,34 @@
           </svg>
           Download
         `;
+
+        // Add download functionality
+        dl.addEventListener('click', async (e) => {
+          e.preventDefault();
+          if (!m.presigned_url) {
+            toast('No download URL available for this image', 'error');
+            return;
+          }
+
+          try {
+            const response = await fetch(m.presigned_url);
+            if (!response.ok) throw new Error('Failed to fetch image');
+
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = humanFilename(m.key) || `matched_image_${Date.now()}.jpg`; // Ensure filename or fallback
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+            toast(`Downloaded ${humanFilename(m.key)}`, 'success', 2000);
+          } catch (err) {
+            console.error('Download error:', err);
+            toast('Failed to download image. Please try again.', 'error');
+          }
+        });
 
         const copyBtn = document.createElement('button');
         copyBtn.className = 'button-enhanced bg-white border-2 border-gray-200 hover:border-gray-300 text-gray-700 px-4 py-3 rounded-xl text-sm font-semibold flex items-center gap-2 shadow-sm';
